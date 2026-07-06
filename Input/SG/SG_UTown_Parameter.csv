@@ -1,0 +1,36 @@
+parameter,base_value,unit,sensitivity_start,sensitivity_end,sensitivity_step,description,中文说明
+pv_capex_sgd_per_kwp,1200,SGD/kWp,800,1600,400,PV unit installed-capacity capital cost.,光伏单位装机投资成本。
+battery_capex_sgd_per_kwh,400,SGD/kWh,200,1000,50,Battery energy-capacity capital cost.,电池储能单位能量容量投资成本。
+battery_power_capex_sgd_per_kw,180,SGD/kW,80,280,100,Battery power-conversion capital cost.,电池功率转换单位投资成本。
+saidi_min_per_year,150,min/year,0,500,100,System average annual outage duration.,年平均停电持续时间。
+voll_sgd_per_kwh,50,SGD/kWh,0,150,30,Value of lost load per unit unserved electricity equivalent.,单位未供电电量对应的停电损失价值。
+city_name,SG,-,,,,City or region name used in reporting.,城市或地区名称。
+building_name,UTown,-,,,,Building or building-cluster name used in reporting.,建筑或建筑群名称。
+local_refine_window_kwp,3000,kWp,,,,PV capacity search window around the coarse optimum for local refinement.,光伏容量粗筛最优值附近的细化搜索窗口。
+local_refine_step_kwp,500,kWp,,,,PV capacity step used in local refinement.,光伏容量细化搜索步长。
+rooftop_area_m2,300000,m2,,,,Effective rooftop area available for PV installation.,可安装光伏的有效屋顶面积。
+pv_module_power_density_kwp_per_m2,0.135,kWp/m2,,,,PV module rated power density per unit installed area.,单位面积光伏组件装机功率。
+pv_om_fraction_per_year,0.015,fraction/year,,,,Annual PV O&M cost as a fraction of PV CAPEX.,光伏年度运维成本占 CAPEX 比例。
+pv_project_years,15,years,,,,PV project life used for straight-line annualization.,光伏项目寿命。
+cooling_cop,5,-,,,,Cooling coefficient of performance for converting cooling thermal load to electricity.,制冷系统 COP。
+heating_cop,3.5,-,,,,Heating coefficient of performance for converting heating thermal load to electricity.,供热系统 COP。
+saifi_per_year,3,events/year,,,,System average annual interruption frequency.,年平均停电次数。
+battery_om_fraction_per_year,0.02,fraction/year,,,,Annual battery O&M cost as a fraction of battery CAPEX.,电池年度运维成本占 CAPEX 比例。
+battery_max_c_rate,0.5,1/h,,,,Maximum battery charge/discharge power divided by energy capacity.,电池最大充放电倍率。
+battery_roundtrip_efficiency,0.92,fraction,,,,Battery round-trip efficiency.,电池往返效率。
+battery_soc_min_fraction,0.1,fraction,,,,Minimum allowed battery state of charge.,电池最小 SOC。
+battery_soc_max_fraction,0.95,fraction,,,,Maximum allowed battery state of charge.,电池最大 SOC。
+battery_initial_soc_fraction,0.5,fraction,,,,Initial battery state of charge at the beginning of the simulation.,初始 SOC。
+battery_eol_soh_fraction,0.8,fraction,,,,Battery state of health at end of life.,电池寿命终止 SOH。
+battery_rated_cycle_life_to_eol,9000,cycles,,,,Rated cycle life to end-of-life SOH.,到寿命终止的额定循环次数。
+battery_calendar_loss_per_year,0.008,fraction/year,,,,Annual battery calendar degradation rate.,电池日历衰减率。
+battery_max_replacement_years,30,years,,,,Maximum replacement interval if degradation is very low.,最长更换周期。
+local_refine_window_kwh,3000,kWh,,,,Search window around the coarse optimum for local refinement.,在粗筛最优容量附近继续细化的窗口。
+local_refine_step_kwh,100,kWh,,,,Battery energy step used in local refinement.,细化搜索步长。
+outage_seed,42,-,,,,Random seed for outage event generation.,停电随机生成种子。
+forced_event_mode,match_saidi,-,,,,Outage event generation mode.,停电事件生成方式。
+uncertainty_baseline_scenario_count,100,scenarios,,,,Number of random outage scenarios for uncertainty baseline analysis.,不确定性基准分析的随机停电场景数量。
+uncertainty_sensitivity_scenario_count,30,scenarios,,,,Number of random outage scenarios per parameter value for uncertainty sensitivity analysis.,不确定性敏感性分析中每个参数值的随机停电场景数量。
+uncertainty_seed_start,1000,-,,,,First random seed used for uncertainty outage scenarios.,不确定性停电场景使用的起始随机种子编号。
+parallel_workers,6,workers,,,,Number of parallel worker processes for uncertainty analysis; 1 means serial execution.,不确定性分析使用的并行进程数；1 表示串行运行。
+pv_during_outage_available,TRUE,boolean,,,,Whether PV generation is available during outage hours.,停电期间 PV 是否可用。

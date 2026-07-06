@@ -1,0 +1,42 @@
+# Environment and local secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*secret*
+*token*
+
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# JavaScript dependencies, if any are added later
+node_modules/
+
+# Generated data and results
+data/
+results/
+outputs/
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Large generated artifacts
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.log

@@ -1,0 +1,16 @@
+# Optional overrides for the standalone PV-BESS model.
+# Defaults live in src/config.py. This file is intentionally small.
+
+outputs:
+  directory: "outputs"
+
+input:
+  directory: "Input"
+
+pv:
+  base_coverage_fraction: 1.0
+  coverage_candidates: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+  pv_capacity_kwp_at_base_coverage:
+  capex_sgd_per_kwp: 1200.0
+  om_fraction_per_year: 0.015
+  project_years: 25.0
