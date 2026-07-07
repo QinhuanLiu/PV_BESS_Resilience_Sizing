@@ -190,3 +190,42 @@ regret summary tables, or regret figures.
 `--analysis frontier` writes publication-ready PNG figures and matching source-data CSVs for
 the full-building-load resilience frontier. Optional SAIDI-VoLL heatmap figures are left as a
 future extension because they require an additional two-dimensional computational sweep.
+
+## Full-Load Resilience Framework
+
+The new two-stage framework uses the full electric-equivalent building load as the outage service
+target. It does not split load into critical and non-critical portions, and it does not use load
+priority classes.
+
+Stage 1 builds the PV/BESS cost-reliability frontier:
+
+```bash
+python3 pv_bess_sizing.py --input-dir Input --case SG_UTown --analysis frontier
+```
+
+Stage 2 fixes a frontier reference design and sweeps the operational battery reserve level under
+the case's representative TOU tariff:
+
+```bash
+python3 pv_bess_sizing.py --input-dir Input --case SG_UTown --analysis reserve
+```
+
+Run both stages in order with:
+
+```bash
+python3 pv_bess_sizing.py --input-dir Input --case SG_UTown --analysis framework
+```
+
+Frontier outputs are written to `outputs/<City>/<Case>_Resilience_Frontier/`. Reserve sensitivity
+outputs are written to `outputs/<City>/<Case>_Reserve_Sensitivity/` and include:
+
+- `<Case>_Reserve_Sensitivity_All_Results.csv`
+- `<Case>_Reserve_Sensitivity_Cost_Components.csv`
+- `<Case>_Reserve_Sensitivity_Reliability_Metrics.csv`
+- `<Case>_Reserve_Sensitivity_Marginal_Cost.csv`
+- Figure 13-15 PNG files with matching `_Source_Data.csv` files.
+
+Reserve sensitivity reports normal-operation bill cost, outage unserved-energy cost, net cost,
+EUE, achieved LOLP, chance-constraint probability, outage load served ratio, and adjacent reserve
+level marginal net-cost changes. If Stage 1 frontier outputs are missing, `--analysis reserve`
+generates them before running Stage 2.

@@ -17,6 +17,15 @@ def solve_dispatch_greedy(frame: pd.DataFrame, sizing: dict[str, float], config:
     soc = batt_cap * float(batt_cfg["initial_soc_fraction"])
     soc_min = batt_cap * float(batt_cfg["soc_min_fraction"])
     soc_max = batt_cap * float(batt_cfg["soc_max_fraction"])
+    reserve_fraction = batt_cfg.get("normal_operation_reserve_fraction")
+    reserve_soc = soc_min
+    if reserve_fraction is not None:
+        reserve_fraction = float(reserve_fraction)
+        if reserve_fraction < 0.0:
+            raise ValueError("normal_operation_reserve_fraction must be non-negative")
+        if reserve_fraction > float(batt_cfg["soc_max_fraction"]):
+            raise ValueError("normal_operation_reserve_fraction must not exceed soc_max_fraction")
+        reserve_soc = max(soc_min, batt_cap * reserve_fraction)
     low_price = float(frame["tou_sgd_per_kwh"].quantile(0.30))
     high_price = float(frame["tou_sgd_per_kwh"].quantile(0.75))
     rows: list[dict[str, float]] = []
@@ -61,7 +70,7 @@ def solve_dispatch_greedy(frame: pd.DataFrame, sizing: dict[str, float], config:
         normal_need -= used
 
         if price >= high_price and batt_cap > 0 and batt_power > 0 and normal_need > 0:
-            max_discharge = min((soc - soc_min) * eta, batt_power * availability, normal_need)
+            max_discharge = min((soc - reserve_soc) * eta, batt_power * availability, normal_need)
             discharge = max(0.0, max_discharge)
             soc -= discharge / max(eta, 1e-9)
             batt_discharge += discharge
