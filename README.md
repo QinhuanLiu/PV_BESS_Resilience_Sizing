@@ -216,6 +216,12 @@ Run both stages in order with:
 python3 pv_bess_sizing.py --input-dir Input --case SG_UTown --analysis framework
 ```
 
+Run the lightweight representative single-scenario sensitivity figures with:
+
+```bash
+python3 pv_bess_sizing.py --input-dir Input --case SG_UTown --analysis representative-sensitivity
+```
+
 Frontier outputs are written to `outputs/<City>/<Case>_Resilience_Frontier/`. Reserve sensitivity
 outputs are written to `outputs/<City>/<Case>_Reserve_Sensitivity/` and include:
 
@@ -229,3 +235,18 @@ Reserve sensitivity reports normal-operation bill cost, outage unserved-energy c
 EUE, achieved LOLP, chance-constraint probability, outage load served ratio, and adjacent reserve
 level marginal net-cost changes. If Stage 1 frontier outputs are missing, `--analysis reserve`
 generates them before running Stage 2.
+
+Representative sensitivity outputs are written to
+`outputs/<City>/<Case>_Representative_Sensitivity/` and include:
+
+- `<Case>_Representative_Sensitivity_All_Results.csv`
+- `<Case>_Representative_Sensitivity_Cost_Reliability.csv`
+- `<Case>_Representative_Sensitivity_Reserve_Change.csv`
+- Figure 1, Figure 11, Figure 12, and Figure 16 PNG files with matching `_Source_Data.csv` files.
+
+Figure 1 summarizes the research framework. Figure 11 evaluates fixed-design PV and battery CAPEX
+sensitivity. Figure 12 evaluates a deterministic SAIDI-VoLL sensitivity grid. Figure 16 follows
+the logic of the reserve-change plot in the referenced tariff-resilience study by reporting the
+net-cost change when reserve is increased from 20% to 80%. These representative sensitivity
+figures use one typical outage scenario and fixed PV-BESS capacity; they should not be interpreted
+as replacements for the 100-scenario frontier results.

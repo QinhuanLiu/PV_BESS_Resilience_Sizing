@@ -13,6 +13,10 @@ from src.optimizer import resilience_design_pair
 from src.outage import simulate_outages, summarize_outages
 from src.frontier_visualization import make_frontier_figures
 from src.reporting import write_csv
+from src.representative_sensitivity import (
+    make_representative_sensitivity_figures,
+    run_representative_sensitivity as run_representative_sensitivity_analysis,
+)
 from src.resilience_frontier import frontier_outage_scenarios_for_csv, run_resilience_frontier
 from src.reserve_sensitivity import (
     load_frontier_outputs_for_reserve,
@@ -117,6 +121,10 @@ def _frontier_dir(output_dir: Path, city_key: str, case_key: str) -> Path:
 
 def _reserve_dir(output_dir: Path, city_key: str, case_key: str) -> Path:
     return output_dir / city_key / f"{case_key}_Reserve_Sensitivity"
+
+
+def _representative_sensitivity_dir(output_dir: Path, city_key: str, case_key: str) -> Path:
+    return output_dir / city_key / f"{case_key}_Representative_Sensitivity"
 
 
 def _write_case_outputs(
@@ -253,6 +261,29 @@ def _write_reserve_outputs(
     return paths
 
 
+def _write_representative_sensitivity_outputs(
+    sensitivity_dir: Path,
+    case_key: str,
+    all_results: pd.DataFrame,
+    cost_reliability: pd.DataFrame,
+    reserve_change: pd.DataFrame,
+) -> dict[str, Path]:
+    paths: dict[str, Path] = {}
+    paths["representative_sensitivity_all_results"] = write_csv(
+        sensitivity_dir / f"{case_key}_Representative_Sensitivity_All_Results.csv",
+        all_results,
+    )
+    paths["representative_sensitivity_cost_reliability"] = write_csv(
+        sensitivity_dir / f"{case_key}_Representative_Sensitivity_Cost_Reliability.csv",
+        cost_reliability,
+    )
+    paths["representative_sensitivity_reserve_change"] = write_csv(
+        sensitivity_dir / f"{case_key}_Representative_Sensitivity_Reserve_Change.csv",
+        reserve_change,
+    )
+    return paths
+
+
 def _filter_cases(cases, city_filters: list[str] | None, case_filters: list[str] | None):
     city_set = set(city_filters or [])
     case_set = set(case_filters or [])
@@ -365,6 +396,7 @@ def run_selected(
     run_uncertainty_sensitivity: bool = False,
     run_frontier: bool = False,
     run_reserve: bool = False,
+    run_representative_sensitivity: bool = False,
     city_filters: list[str] | None = None,
     case_filters: list[str] | None = None,
     sensitivity_parameters: list[str] | None = None,
@@ -387,6 +419,7 @@ def run_selected(
         uncertainty_sensitivity_dir = _uncertainty_sensitivity_dir(output_dir, case.city_key, case_key)
         frontier_dir = _frontier_dir(output_dir, case.city_key, case_key)
         reserve_dir = _reserve_dir(output_dir, case.city_key, case_key)
+        representative_sensitivity_dir = _representative_sensitivity_dir(output_dir, case.city_key, case_key)
         parameter_table = _parameter_table(case_key, case.city_key, case.building_key, parameters.raw)
         frontier_results: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame] | None = None
 
@@ -575,6 +608,60 @@ def run_selected(
             ).items():
                 paths[f"{case_key}_reserve_{name}"] = path
 
+        if run_representative_sensitivity:
+            if frontier_results is None:
+                loaded_frontier = load_frontier_outputs_for_reserve(case, case_config, frontier_dir, case_key)
+                if loaded_frontier is None:
+                    frontier_results = run_resilience_frontier(case, case_config, parameters)
+                    all_candidates, scenario_results, optimal_designs, outage_scenarios = frontier_results
+                    for name, path in _write_frontier_outputs(
+                        frontier_dir,
+                        case_key,
+                        all_candidates,
+                        scenario_results,
+                        optimal_designs,
+                        outage_scenarios,
+                    ).items():
+                        paths[f"{case_key}_{name}"] = path
+                    for name, path in make_frontier_figures(
+                        frontier_dir,
+                        case,
+                        case_config,
+                        case_key,
+                        all_candidates,
+                        scenario_results,
+                        optimal_designs,
+                        outage_scenarios,
+                    ).items():
+                        paths[f"{case_key}_frontier_{name}"] = path
+                else:
+                    optimal_designs, _ = loaded_frontier
+            else:
+                _, _, optimal_designs, _ = frontier_results
+
+            representative_results = run_representative_sensitivity_analysis(
+                case,
+                case_config,
+                parameters,
+                optimal_designs,
+            )
+            all_results, cost_reliability, reserve_change = representative_results
+            for name, path in _write_representative_sensitivity_outputs(
+                representative_sensitivity_dir,
+                case_key,
+                all_results,
+                cost_reliability,
+                reserve_change,
+            ).items():
+                paths[f"{case_key}_{name}"] = path
+            for name, path in make_representative_sensitivity_figures(
+                representative_sensitivity_dir,
+                case_key,
+                all_results,
+                reserve_change,
+            ).items():
+                paths[f"{case_key}_representative_sensitivity_{name}"] = path
+
     if baseline_rows:
         _ = pd.concat(baseline_rows, ignore_index=True)
     if sensitivity_rows:
@@ -632,7 +719,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--analysis",
-        choices=["all", "baseline", "sensitivity", "uncertainty", "frontier", "reserve", "framework"],
+        choices=[
+            "all",
+            "baseline",
+            "sensitivity",
+            "uncertainty",
+            "frontier",
+            "reserve",
+            "framework",
+            "representative-sensitivity",
+        ],
         default="all",
         help="Top-level analysis selection. Default: all.",
     )
@@ -663,6 +759,7 @@ def main() -> None:
     )
     run_frontier = analysis in {"frontier", "framework"}
     run_reserve = analysis in {"reserve", "framework"}
+    run_representative_sensitivity = analysis == "representative-sensitivity"
     paths = run_selected(
         config,
         input_root,
@@ -673,6 +770,7 @@ def main() -> None:
         run_uncertainty_sensitivity=run_uncertainty_sensitivity,
         run_frontier=run_frontier,
         run_reserve=run_reserve,
+        run_representative_sensitivity=run_representative_sensitivity,
         city_filters=args.city,
         case_filters=args.case,
         sensitivity_parameters=sensitivity_parameters,
