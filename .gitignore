@@ -26,13 +26,25 @@ node_modules/
 data/
 results/
 outputs/
+figures/
+reports/generated/
 
 # OS and editor files
 .DS_Store
 .idea/
 .vscode/
 
-# Large generated artifacts
+# Temporary and scratch files
+tmp/
+temp/
+scratch/
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# Large generated artifacts and binary result dumps
 *.zip
 *.tar
 *.tar.gz
@@ -40,3 +52,15 @@ outputs/
 *.7z
 *.rar
 *.log
+*.h5
+*.hdf5
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.joblib
+*.npy
+*.npz
+*.mat
+*.sqlite
+*.sqlite3
