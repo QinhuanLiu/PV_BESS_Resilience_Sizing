@@ -12,6 +12,7 @@ from src.data_loader import SENSITIVITY_PARAMETERS, build_case_frame, discover_i
 from src.optimizer import resilience_design_pair
 from src.outage import simulate_outages, summarize_outages
 from src.reporting import write_csv
+from src.resilience_frontier import frontier_outage_scenarios_for_csv, run_resilience_frontier
 from src.uncertainty import run_uncertainty_analysis
 from src.visualization import (
     make_baseline_figures,
@@ -104,6 +105,10 @@ def _uncertainty_sensitivity_dir(output_dir: Path, city_key: str, case_key: str)
     return _uncertainty_dir(output_dir, city_key, case_key) / f"{case_key}_Uncertainty_Sensitive_Analysis"
 
 
+def _frontier_dir(output_dir: Path, city_key: str, case_key: str) -> Path:
+    return output_dir / city_key / f"{case_key}_Resilience_Frontier"
+
+
 def _write_case_outputs(
     case_dir: Path,
     case_key: str,
@@ -179,6 +184,34 @@ def _write_uncertainty_sensitivity_outputs(
         parameters_to_plot=selected_parameters,
     ).items():
         paths[f"uncertainty_sensitivity_{name}"] = path
+    return paths
+
+
+def _write_frontier_outputs(
+    frontier_dir: Path,
+    case_key: str,
+    all_candidates: pd.DataFrame,
+    scenario_results: pd.DataFrame,
+    optimal_designs: pd.DataFrame,
+    outage_scenarios: pd.DataFrame,
+) -> dict[str, Path]:
+    paths: dict[str, Path] = {}
+    paths["frontier_all_candidates"] = write_csv(
+        frontier_dir / f"{case_key}_Frontier_All_Candidates.csv",
+        all_candidates,
+    )
+    paths["frontier_scenario_results"] = write_csv(
+        frontier_dir / f"{case_key}_Frontier_Scenario_Results.csv",
+        scenario_results,
+    )
+    paths["frontier_optimal_designs"] = write_csv(
+        frontier_dir / f"{case_key}_Frontier_Optimal_Designs.csv",
+        optimal_designs,
+    )
+    paths["frontier_outage_scenarios"] = write_csv(
+        frontier_dir / f"{case_key}_Frontier_Outage_Scenarios.csv",
+        frontier_outage_scenarios_for_csv(outage_scenarios),
+    )
     return paths
 
 
@@ -292,6 +325,7 @@ def run_selected(
     run_sensitivity: bool = True,
     run_uncertainty_baseline: bool = False,
     run_uncertainty_sensitivity: bool = False,
+    run_frontier: bool = False,
     city_filters: list[str] | None = None,
     case_filters: list[str] | None = None,
     sensitivity_parameters: list[str] | None = None,
@@ -312,6 +346,7 @@ def run_selected(
         sens_dir = _sensitivity_dir(output_dir, case.city_key, case_key)
         uncertainty_baseline_dir = _uncertainty_baseline_dir(output_dir, case.city_key, case_key)
         uncertainty_sensitivity_dir = _uncertainty_sensitivity_dir(output_dir, case.city_key, case_key)
+        frontier_dir = _frontier_dir(output_dir, case.city_key, case_key)
         parameter_table = _parameter_table(case_key, case.city_key, case.building_key, parameters.raw)
 
         rows = pd.DataFrame()
@@ -418,6 +453,22 @@ def run_selected(
                 ).items():
                     paths[f"{case_key}_{name}"] = path
 
+        if run_frontier:
+            all_candidates, scenario_results, optimal_designs, outage_scenarios = run_resilience_frontier(
+                case,
+                case_config,
+                parameters,
+            )
+            for name, path in _write_frontier_outputs(
+                frontier_dir,
+                case_key,
+                all_candidates,
+                scenario_results,
+                optimal_designs,
+                outage_scenarios,
+            ).items():
+                paths[f"{case_key}_{name}"] = path
+
     if baseline_rows:
         _ = pd.concat(baseline_rows, ignore_index=True)
     if sensitivity_rows:
@@ -475,7 +526,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--analysis",
-        choices=["all", "baseline", "sensitivity", "uncertainty"],
+        choices=["all", "baseline", "sensitivity", "uncertainty", "frontier"],
         default="all",
         help="Top-level analysis selection. Default: all.",
     )
@@ -504,6 +555,7 @@ def main() -> None:
     run_uncertainty_sensitivity = analysis == "all" or (
         analysis == "uncertainty" and uncertainty_analysis in {"all", "sensitivity"}
     )
+    run_frontier = analysis == "frontier"
     paths = run_selected(
         config,
         input_root,
@@ -512,6 +564,7 @@ def main() -> None:
         run_sensitivity=run_sensitivity,
         run_uncertainty_baseline=run_uncertainty_baseline,
         run_uncertainty_sensitivity=run_uncertainty_sensitivity,
+        run_frontier=run_frontier,
         city_filters=args.city,
         case_filters=args.case,
         sensitivity_parameters=sensitivity_parameters,
