@@ -91,6 +91,7 @@ def _generate_outage_scenarios(
                 "outage_weight_sum_hours": float(profile["outage_fraction"].astype(float).sum()),
                 **summary,
                 "_outage_profile": profile,
+                "_outage_events": events,
             }
         )
     return pd.DataFrame(rows)
@@ -239,7 +240,7 @@ def _optimal_designs(
 
 
 def frontier_outage_scenarios_for_csv(outage_scenarios: pd.DataFrame) -> pd.DataFrame:
-    return outage_scenarios.drop(columns=["_outage_profile"], errors="ignore")
+    return outage_scenarios.drop(columns=["_outage_profile", "_outage_events"], errors="ignore")
 
 
 def _positive_int(value: Any, default: int, name: str) -> int:

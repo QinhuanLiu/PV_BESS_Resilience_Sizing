@@ -11,6 +11,7 @@ from src.config import load_config
 from src.data_loader import SENSITIVITY_PARAMETERS, build_case_frame, discover_input_cases, load_input_case, sensitivity_runs
 from src.optimizer import resilience_design_pair
 from src.outage import simulate_outages, summarize_outages
+from src.frontier_visualization import make_frontier_figures
 from src.reporting import write_csv
 from src.resilience_frontier import frontier_outage_scenarios_for_csv, run_resilience_frontier
 from src.uncertainty import run_uncertainty_analysis
@@ -468,6 +469,17 @@ def run_selected(
                 outage_scenarios,
             ).items():
                 paths[f"{case_key}_{name}"] = path
+            for name, path in make_frontier_figures(
+                frontier_dir,
+                case,
+                case_config,
+                case_key,
+                all_candidates,
+                scenario_results,
+                optimal_designs,
+                outage_scenarios,
+            ).items():
+                paths[f"{case_key}_frontier_{name}"] = path
 
     if baseline_rows:
         _ = pd.concat(baseline_rows, ignore_index=True)

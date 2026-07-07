@@ -184,3 +184,9 @@ Main uncertainty outputs:
 
 The uncertainty module intentionally does not output explanatory scatter plots, regret fields,
 regret summary tables, or regret figures.
+
+## Resilience Frontier Figures
+
+`--analysis frontier` writes publication-ready PNG figures and matching source-data CSVs for
+the full-building-load resilience frontier. Optional SAIDI-VoLL heatmap figures are left as a
+future extension because they require an additional two-dimensional computational sweep.

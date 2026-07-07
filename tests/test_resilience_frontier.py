@@ -165,6 +165,27 @@ class ResilienceFrontierTests(unittest.TestCase):
             self.assertIn("SG_UTown_frontier_all_candidates", paths)
             candidates = pd.read_csv(frontier / "SG_UTown_Frontier_All_Candidates.csv")
             self.assertIn("system_total_cost_sgd_per_year", candidates.columns)
+            figure_labels = [
+                "Figure_2_Input_Profiles",
+                "Figure_3_Outage_Scenarios",
+                "Figure_4_PV_Building_Load_Mismatch",
+                "Figure_5_Battery_vs_Outage_Load_Served_Ratio",
+                "Figure_6_Battery_vs_EUE_Unserved_Cost",
+                "Figure_7_Battery_vs_System_Total_Cost",
+                "Figure_8_Battery_vs_Achieved_LOLP",
+                "Figure_9_Battery_vs_Chance_Constraint_Probability",
+                "Figure_10_Marginal_Cost_Reliability",
+            ]
+            for label in figure_labels:
+                base = frontier / f"SG_UTown_{label}"
+                self.assertTrue(base.with_suffix(".png").exists())
+                self.assertTrue(base.with_name(base.name + "_Source_Data.csv").exists())
+            figure_5_source = pd.read_csv(
+                frontier / "SG_UTown_Figure_5_Battery_vs_Outage_Load_Served_Ratio_Source_Data.csv"
+            )
+            self.assertIn("battery_energy_kwh", figure_5_source.columns)
+            self.assertIn("pv_capacity_kwp", figure_5_source.columns)
+            self.assertIn("mean_outage_load_served_ratio", figure_5_source.columns)
 
 
 if __name__ == "__main__":
