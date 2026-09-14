@@ -19,9 +19,9 @@ def parameter_sources_table(config: dict[str, Any]) -> pd.DataFrame:
         [
             {
                 "parameter": "PV CAPEX",
-                "value": pv["capex_sgd_per_kwp"],
-                "unit": "SGD/kWp",
-                "source_or_assumption": "EMA Singapore rooftop PV factsheet range S$1,000-1,600/kWp; central value used.",
+                "value": pv["capex_sgd_per_kw"],
+                "unit": "SGD/kW",
+                "source_or_assumption": "EMA Singapore rooftop PV factsheet range S$1,000-1,600/kW; central value used.",
             },
             {
                 "parameter": "PV O&M",
@@ -107,13 +107,12 @@ def parameter_sources_table(config: dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def make_four_city_comparison(long_df: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
+def make_case_design_summary(long_df: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for key in config["scenario_order"]:
         sc = config["scenarios"][key]
         batt = _effective_battery_economics(config, key)
-        flex = long_df[(long_df["scenario"] == key) & (long_df["design_case"] == "flexibility_only")].iloc[0]
-        aware = long_df[(long_df["scenario"] == key) & (long_df["design_case"] == "resilience_informed")].iloc[0]
+        design = long_df[long_df["scenario"] == key].iloc[0]
         rows.append(
             {
                 "scenario": key,
@@ -126,22 +125,12 @@ def make_four_city_comparison(long_df: pd.DataFrame, config: dict[str, Any]) -> 
                 "battery_capex_sgd_per_kwh": batt["battery_capex_sgd_per_kwh"],
                 "battery_power_capex_sgd_per_kw": batt["battery_power_capex_sgd_per_kw"],
                 "battery_om_fraction_per_year": batt["battery_om_fraction_per_year"],
-                "system_annual_cost_flexibility_only_sgd": flex["pv_bess_system_annual_cost_sgd"],
-                "system_annual_cost_resilience_informed_sgd": aware["pv_bess_system_annual_cost_sgd"],
-                "system_annual_cost_delta_resilience_minus_flex_sgd": (
-                    aware["pv_bess_system_annual_cost_sgd"] - flex["pv_bess_system_annual_cost_sgd"]
-                ),
-                "private_annual_cost_flexibility_only_sgd": flex["pv_bess_private_annual_cost_sgd"],
-                "private_annual_cost_resilience_informed_sgd": aware["pv_bess_private_annual_cost_sgd"],
-                "battery_flexibility_only_kwh": flex["battery_energy_kwh"],
-                "battery_resilience_informed_kwh": aware["battery_energy_kwh"],
-                "battery_delta_resilience_minus_flex_kwh": aware["battery_energy_kwh"] - flex["battery_energy_kwh"],
-                "unserved_energy_flexibility_only_kwh_per_year": flex["unserved_energy_kwh_per_year"],
-                "unserved_energy_resilience_informed_kwh_per_year": aware["unserved_energy_kwh_per_year"],
-                "unserved_energy_cost_flexibility_only_sgd_per_year": flex["unserved_energy_cost_sgd_per_year"],
-                "unserved_energy_cost_resilience_informed_sgd_per_year": aware["unserved_energy_cost_sgd_per_year"],
-                "avoided_unserved_energy_flexibility_only_kwh_per_year": flex["avoided_unserved_energy_kwh_per_year"],
-                "avoided_unserved_energy_resilience_informed_kwh_per_year": aware["avoided_unserved_energy_kwh_per_year"],
+                "system_annual_cost_sgd": design["pv_bess_system_annual_cost_sgd"],
+                "private_annual_cost_sgd": design["pv_bess_private_annual_cost_sgd"],
+                "battery_energy_kwh": design["battery_energy_kwh"],
+                "unserved_energy_kwh_per_year": design["unserved_energy_kwh_per_year"],
+                "unserved_energy_cost_sgd_per_year": design["unserved_energy_cost_sgd_per_year"],
+                "avoided_unserved_energy_kwh_per_year": design["avoided_unserved_energy_kwh_per_year"],
             }
         )
     return pd.DataFrame(rows)

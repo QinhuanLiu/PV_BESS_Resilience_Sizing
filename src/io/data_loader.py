@@ -21,20 +21,28 @@ REQUIRED_PARAMETER_COLUMNS = [
     "中文说明",
 ]
 SENSITIVITY_PARAMETERS = [
-    "pv_capex_sgd_per_kwp",
+    "pv_capex_sgd_per_kw",
     "battery_capex_sgd_per_kwh",
     "battery_power_capex_sgd_per_kw",
     "saidi_min_per_year",
+    "saifi_per_year",
     "voll_sgd_per_kwh",
 ]
 REMOVED_PV_PARAMETERS = {
     "base_pv_coverage_fraction",
-    "pv_capacity_kwp_at_base_coverage",
+    "pv_capacity_kw_at_base_coverage",
     "pv_coverage_candidates",
     "pv_coverage_fraction",
-    "pv_capacity_kwp_candidates",
+    "pv_capacity_kw_candidates",
     "battery_energy_kwh_candidates",
 }
+LOAD_COLUMN_ALIASES = {
+    "Cooling load (kWh_th)": "Cooling",
+    "Heating load (kWh_th)": "Heating",
+    "Lighting load (kWh_e)": "Lighting",
+    "Equipment load (kWh_e)": "Equipment",
+}
+PV_OUTPUT_COLUMN = "PV_output_kWh_per_m2"
 
 
 @dataclass(frozen=True)
@@ -67,6 +75,10 @@ def discover_input_cases(input_dir: str | Path) -> list[InputCase]:
     for city_dir in sorted(path for path in root.iterdir() if path.is_dir()):
         grouped: dict[str, dict[str, Path]] = {}
         for csv_path in sorted(city_dir.glob("*.csv")):
+            if csv_path.stem.endswith("_hourly_loads_kWh"):
+                prefix = city_dir.name
+                grouped.setdefault(prefix, {})["Load"] = csv_path
+                continue
             for suffix in ("Load", "PV", "TOU", "Parameter"):
                 marker = f"_{suffix}"
                 if csv_path.stem.endswith(marker):
@@ -78,14 +90,18 @@ def discover_input_cases(input_dir: str | Path) -> list[InputCase]:
             missing = [suffix for suffix in ("Load", "PV", "TOU", "Parameter") if suffix not in files]
             if missing:
                 raise ValueError(f"Input case {prefix} in {city_dir} is missing files: {', '.join(missing)}")
-            if not prefix.startswith(f"{city_dir.name}_"):
+            if prefix == city_dir.name and "_" in prefix:
+                city_key, building_key = prefix.rsplit("_", 1)
+            elif prefix.startswith(f"{city_dir.name}_"):
+                city_key = city_dir.name
+                building_key = prefix[len(city_dir.name) + 1 :]
+            else:
                 raise ValueError(f"Input case prefix {prefix} must start with city folder name {city_dir.name}_")
-            building_key = prefix[len(city_dir.name) + 1 :]
             if not building_key:
                 raise ValueError(f"Input case prefix {prefix} does not include a building name")
             cases.append(
                 InputCase(
-                    city_key=city_dir.name,
+                    city_key=city_key,
                     building_key=building_key,
                     case_key=prefix,
                     city_dir=city_dir,
@@ -101,23 +117,41 @@ def discover_input_cases(input_dir: str | Path) -> list[InputCase]:
     return cases
 
 
+def read_load_csv(path: str | Path) -> pd.DataFrame:
+    """Read load input and normalize supported real-data column names in memory."""
+    return pd.read_csv(path).rename(columns=LOAD_COLUMN_ALIASES)
+
+
+def read_pv_csv(path: str | Path) -> pd.DataFrame:
+    """Read PV input, keeping the required output column when source files include extras."""
+    frame = pd.read_csv(path)
+    if PV_OUTPUT_COLUMN in frame.columns:
+        return frame[[PV_OUTPUT_COLUMN]].copy()
+    return frame
+
+
+def read_tou_csv(path: str | Path) -> pd.DataFrame:
+    return pd.read_csv(path)
+
+
 def load_case_parameters(parameter_csv: str | Path) -> CaseParameters:
     raw = pd.read_csv(parameter_csv)
     missing_columns = [column for column in REQUIRED_PARAMETER_COLUMNS if column not in raw.columns]
     if missing_columns:
         raise ValueError(f"Parameter file {parameter_csv} is missing columns: {', '.join(missing_columns)}")
     if len(raw) < len(SENSITIVITY_PARAMETERS):
-        raise ValueError(f"Parameter file {parameter_csv} must include the five sensitivity parameters first")
+        raise ValueError(f"Parameter file {parameter_csv} must include the six sensitivity parameters first")
 
     first_parameters = raw["parameter"].head(len(SENSITIVITY_PARAMETERS)).tolist()
     if first_parameters != SENSITIVITY_PARAMETERS:
         if first_parameters and first_parameters[0] == "fixed_pv_coverage_fraction":
             raise ValueError(
                 "fixed_pv_coverage_fraction is no longer a sensitivity parameter; "
-                "PV capacity is optimized through adaptive capacity search."
+                "PV capacity is optimized through adaptive capacity search, and rooftop coverage is "
+                "a derived diagnostic field."
             )
         raise ValueError(
-            "The first five parameters must be "
+            "The first six parameters must be "
             + ", ".join(SENSITIVITY_PARAMETERS)
             + f"; got {', '.join(str(x) for x in first_parameters)}"
         )
@@ -130,7 +164,8 @@ def load_case_parameters(parameter_csv: str | Path) -> CaseParameters:
             "Removed PV parameter(s) found in "
             f"{parameter_csv}: {', '.join(removed)}. "
             "PV-BESS sizing now derives capacity candidates adaptively from the 8760 load/PV inputs, "
-            "rooftop_area_m2, and pv_module_power_density_kwp_per_m2."
+            "rooftop_area_m2, and pv_module_power_density_kw_per_m2. Rooftop coverage is retained "
+            "only as a derived diagnostic field."
         )
 
     base: dict[str, Any] = {}
@@ -146,7 +181,7 @@ def load_case_parameters(parameter_csv: str | Path) -> CaseParameters:
         )
         if values:
             if parameter not in SENSITIVITY_PARAMETERS:
-                raise ValueError(f"Only the five approved sensitivity parameters can define a range: {parameter}")
+                raise ValueError(f"Only the six approved sensitivity parameters can define a range: {parameter}")
             sensitivity[parameter] = values
     return CaseParameters(base=base, sensitivity=sensitivity, raw=raw)
 
@@ -155,14 +190,14 @@ def load_input_case(
     case: InputCase,
     global_config: dict[str, Any],
     parameter_overrides: dict[str, Any] | None = None,
-    pv_capacity_kwp: float | None = None,
+    pv_capacity_kw: float | None = None,
 ) -> tuple[pd.DataFrame, dict[str, float | str], dict[str, Any], CaseParameters]:
     parameters = load_case_parameters(case.parameter_csv)
     base = dict(parameters.base)
     if parameter_overrides:
         base.update(parameter_overrides)
     case_config = case_config_from_parameters(global_config, case, base)
-    frame, pv_meta = build_case_frame(case, case_config, pv_capacity_kwp)
+    frame, pv_meta = build_case_frame(case, case_config, pv_capacity_kw)
     return frame, pv_meta, case_config, parameters
 
 
@@ -180,14 +215,14 @@ def case_config_from_parameters(global_config: dict[str, Any], case: InputCase, 
     config["technical"]["pv_during_outage_available"] = _bool_param(params, "pv_during_outage_available", True)
 
     config["pv"] = deepcopy(global_config.get("pv", {}))
-    config["pv"]["local_refine_window_kwp"] = _nonnegative_float_param(params, "local_refine_window_kwp", 3000.0)
-    config["pv"]["local_refine_step_kwp"] = _positive_float_param(params, "local_refine_step_kwp")
+    config["pv"]["local_refine_window_kw"] = _nonnegative_float_param(params, "local_refine_window_kw", 3000.0)
+    config["pv"]["local_refine_step_kw"] = _positive_float_param(params, "local_refine_step_kw")
     config["pv"]["rooftop_area_m2"] = _positive_float_param(params, "rooftop_area_m2")
-    config["pv"]["module_power_density_kwp_per_m2"] = _positive_float_param(
+    config["pv"]["module_power_density_kw_per_m2"] = _positive_float_param(
         params,
-        "pv_module_power_density_kwp_per_m2",
+        "pv_module_power_density_kw_per_m2",
     )
-    config["pv"]["capex_sgd_per_kwp"] = _float_param(params, "pv_capex_sgd_per_kwp", 1200.0)
+    config["pv"]["capex_sgd_per_kw"] = _float_param(params, "pv_capex_sgd_per_kw", 1200.0)
     config["pv"]["om_fraction_per_year"] = _float_param(params, "pv_om_fraction_per_year", 0.015)
     config["pv"]["project_years"] = _float_param(params, "pv_project_years", 25.0)
 
@@ -220,6 +255,16 @@ def case_config_from_parameters(global_config: dict[str, Any], case: InputCase, 
     config["outage"] = deepcopy(global_config.get("outage", {}))
     config["outage"]["seed"] = int(_float_param(params, "outage_seed", 42.0))
     config["outage"]["forced_event_mode"] = str(params.get("forced_event_mode") or "match_saidi")
+    config["outage"]["night_window_start_hour"] = _float_param(
+        params,
+        "night_window_start_hour",
+        float(config["outage"].get("night_window_start_hour", 19.0)),
+    )
+    config["outage"]["night_window_end_hour"] = _float_param(
+        params,
+        "night_window_end_hour",
+        float(config["outage"].get("night_window_end_hour", 23.0)),
+    )
 
     config["uncertainty"] = deepcopy(global_config.get("uncertainty", {}))
     config["uncertainty"]["baseline_scenario_count"] = _positive_int_param(
@@ -254,12 +299,12 @@ def case_config_from_parameters(global_config: dict[str, Any], case: InputCase, 
 
 
 def _apply_adaptive_capacity_search(case: InputCase, config: dict[str, Any]) -> None:
-    load = pd.read_csv(case.load_csv)
-    pv = pd.read_csv(case.pv_csv)
+    load = read_load_csv(case.load_csv)
+    pv = read_pv_csv(case.pv_csv)
     _validate_8760(load, case.load_csv)
     _validate_8760(pv, case.pv_csv)
     _validate_required_columns(load, ["Cooling", "Heating", "Lighting", "Equipment"], case.load_csv)
-    _validate_required_columns(pv, ["PV_output_kWh_per_m2"], case.pv_csv)
+    _validate_required_columns(pv, [PV_OUTPUT_COLUMN], case.pv_csv)
 
     cooling_cop = max(float(config["technical"].get("cooling_cop", 5.0)), 1e-9)
     heating_cop = max(float(config["technical"].get("heating_cop", 3.5)), 1e-9)
@@ -276,23 +321,23 @@ def _apply_adaptive_capacity_search(case: InputCase, config: dict[str, Any]) -> 
     if annual_load <= 0.0 or peak_load <= 0.0:
         raise ValueError(f"Input case {case.case_key} must have positive electric-equivalent load")
 
-    module_power_density = max(float(config["pv"]["module_power_density_kwp_per_m2"]), 1e-9)
-    pv_per_kwp = pv["PV_output_kWh_per_m2"].astype(float).to_numpy() / module_power_density
-    if np.any(pv_per_kwp < 0):
-        raise ValueError(f"Input case {case.case_key} generated negative PV output per kWp")
-    annual_pv_per_kwp = float(pv_per_kwp.sum())
-    peak_pv_per_kwp = float(pv_per_kwp.max())
-    if annual_pv_per_kwp <= 0.0 or peak_pv_per_kwp <= 0.0:
+    module_power_density = max(float(config["pv"]["module_power_density_kw_per_m2"]), 1e-9)
+    pv_per_kw = pv[PV_OUTPUT_COLUMN].astype(float).to_numpy() / module_power_density
+    if np.any(pv_per_kw < 0):
+        raise ValueError(f"Input case {case.case_key} generated negative PV output per kW")
+    annual_pv_per_kw = float(pv_per_kw.sum())
+    peak_pv_per_kw = float(pv_per_kw.max())
+    if annual_pv_per_kw <= 0.0 or peak_pv_per_kw <= 0.0:
         raise ValueError(f"Input case {case.case_key} must have positive PV_output_kWh_per_m2")
 
     scenario = config["scenarios"][case.case_key]
     saidi = max(float(scenario.get("saidi_min_per_year", 0.0)), 0.0)
     saifi = max(float(scenario.get("saifi_per_year", 0.0)), 0.0)
-    event_hours = saidi / 60.0 / max(saifi, 1e-9) if saidi > 0.0 else 0.0
+    event_hours = saidi / 60.0 / saifi if saidi > 0.0 and saifi > 0.0 else 0.0
 
-    pv_annual_kwp = annual_load / annual_pv_per_kwp
-    pv_peak_kwp = peak_load / peak_pv_per_kwp
-    pv_upper = max(1.10 * pv_annual_kwp, 1.05 * pv_peak_kwp)
+    pv_annual_kw = annual_load / annual_pv_per_kw
+    pv_peak_kw = peak_load / peak_pv_per_kw
+    pv_upper = max(1.10 * pv_annual_kw, 1.05 * pv_peak_kw)
     battery_upper = max(0.60 * annual_load / 365.0, 1.50 * peak_load * event_hours)
 
     search_cfg = config.get("capacity_search", {})
@@ -301,9 +346,9 @@ def _apply_adaptive_capacity_search(case: InputCase, config: dict[str, Any]) -> 
 
     pv_candidates, pv_step = _adaptive_axis(pv_upper, intervals=intervals)
     battery_candidates, battery_step = _adaptive_axis(battery_upper, intervals=intervals)
-    config["pv"]["capacity_kwp_candidates"] = pv_candidates
-    config["pv"]["local_refine_window_kwp"] = pv_step
-    config["pv"]["local_refine_step_kwp"] = max(pv_step / refine_divisions, 1e-6)
+    config["pv"]["capacity_kw_candidates"] = pv_candidates
+    config["pv"]["local_refine_window_kw"] = pv_step
+    config["pv"]["local_refine_step_kw"] = max(pv_step / refine_divisions, 1e-6)
     config["battery"]["energy_kwh_candidates"] = battery_candidates
     config["battery"]["local_refine_window_kwh"] = battery_step
     config["battery"]["local_refine_step_kwh"] = max(battery_step / refine_divisions, 1e-6)
@@ -314,11 +359,11 @@ def _apply_adaptive_capacity_search(case: InputCase, config: dict[str, Any]) -> 
         "local_refine_divisions": refine_divisions,
         "annual_load_e_equiv_kwh": annual_load,
         "peak_load_e_equiv_kw": peak_load,
-        "annual_pv_output_kwh_per_kwp": annual_pv_per_kwp,
-        "peak_pv_output_kw_per_kwp": peak_pv_per_kwp,
-        "pv_upper_kwp": float(max(pv_candidates)),
+        "annual_pv_output_kwh_per_kw": annual_pv_per_kw,
+        "peak_pv_output_kw_per_kw": peak_pv_per_kw,
+        "pv_upper_kw": float(max(pv_candidates)),
         "battery_upper_kwh": float(max(battery_candidates)),
-        "pv_coarse_step_kwp": float(pv_step),
+        "pv_coarse_step_kw": float(pv_step),
         "battery_coarse_step_kwh": float(battery_step),
         "event_hours_per_interruption": float(event_hours),
     }
@@ -345,16 +390,16 @@ def _nice_step(raw_step: float) -> float:
 def build_case_frame(
     case: InputCase,
     config: dict[str, Any],
-    pv_capacity_kwp: float | None = None,
+    pv_capacity_kw: float | None = None,
 ) -> tuple[pd.DataFrame, dict[str, float | str]]:
-    load = pd.read_csv(case.load_csv)
-    pv = pd.read_csv(case.pv_csv)
-    tou = pd.read_csv(case.tou_csv)
+    load = read_load_csv(case.load_csv)
+    pv = read_pv_csv(case.pv_csv)
+    tou = read_tou_csv(case.tou_csv)
 
     _validate_8760(load, case.load_csv)
     _validate_8760(pv, case.pv_csv)
     _validate_required_columns(load, ["Cooling", "Heating", "Lighting", "Equipment"], case.load_csv)
-    _validate_required_columns(pv, ["PV_output_kWh_per_m2"], case.pv_csv)
+    _validate_required_columns(pv, [PV_OUTPUT_COLUMN], case.pv_csv)
     _validate_tou(tou, case.tou_csv)
 
     if "timestamp" in load.columns:
@@ -364,16 +409,16 @@ def build_case_frame(
     hour_to_price = dict(zip(tou["hour"].astype(int), tou["tou_sgd_per_kwh"].astype(float)))
 
     pv_cfg = config["pv"]
-    capacity_candidates = [float(value) for value in pv_cfg.get("capacity_kwp_candidates", [])]
+    capacity_candidates = [float(value) for value in pv_cfg.get("capacity_kw_candidates", [])]
     if not capacity_candidates:
         raise ValueError(f"Input case {case.case_key} has no PV capacity candidates")
-    active_capacity_kwp = float(max(capacity_candidates) if pv_capacity_kwp is None else pv_capacity_kwp)
-    _validate_pv_capacity_value(active_capacity_kwp, case.case_key)
-    raw_pv_per_m2 = pv["PV_output_kWh_per_m2"].astype(float)
+    active_capacity_kw = float(max(capacity_candidates) if pv_capacity_kw is None else pv_capacity_kw)
+    _validate_pv_capacity_value(active_capacity_kw, case.case_key)
+    raw_pv_per_m2 = pv[PV_OUTPUT_COLUMN].astype(float)
     rooftop_area_m2 = float(pv_cfg["rooftop_area_m2"])
-    module_power_density = float(pv_cfg["module_power_density_kwp_per_m2"])
-    pv_per_kwp = raw_pv_per_m2 / module_power_density
-    installed_area_m2 = active_capacity_kwp / module_power_density
+    module_power_density = float(pv_cfg["module_power_density_kw_per_m2"])
+    pv_per_kw = raw_pv_per_m2 / module_power_density
+    installed_area_m2 = active_capacity_kw / module_power_density
     rooftop_utilization = installed_area_m2 / rooftop_area_m2
 
     frame = pd.DataFrame(
@@ -383,11 +428,11 @@ def build_case_frame(
             "electric_load_kwh": load["Lighting"].astype(float) + load["Equipment"].astype(float),
             "cooling_load_kwh_th": load["Cooling"].astype(float),
             "heating_load_kwh_th": load["Heating"].astype(float),
-            "pv_kwh": pv_per_kwp * active_capacity_kwp,
+            "pv_kwh": pv_per_kw * active_capacity_kw,
         }
     )
-    frame["pv_capacity_kwp"] = active_capacity_kwp
-    frame["pv_capacity_mwp"] = active_capacity_kwp / 1000.0
+    frame["pv_capacity_kw"] = active_capacity_kw
+    frame["pv_capacity_mw"] = active_capacity_kw / 1000.0
     frame["pv_installed_area_m2"] = float(installed_area_m2)
     frame["pv_rooftop_utilization_fraction"] = float(rooftop_utilization)
     frame["pv_rooftop_utilization_percent"] = float(rooftop_utilization * 100.0)
@@ -397,15 +442,22 @@ def build_case_frame(
 
     pv_meta = {
         "scenario": case.case_key,
-        "pv_capacity_kwp": float(active_capacity_kwp),
-        "pv_capacity_mwp": float(active_capacity_kwp / 1000.0),
+        "pv_capacity_kw": float(active_capacity_kw),
+        "pv_capacity_mw": float(active_capacity_kw / 1000.0),
         "rooftop_area_m2": rooftop_area_m2,
         "pv_installed_area_m2": float(installed_area_m2),
         "pv_rooftop_utilization_fraction": float(rooftop_utilization),
         "pv_rooftop_utilization_percent": float(rooftop_utilization * 100.0),
-        "pv_module_power_density_kwp_per_m2": module_power_density,
-        "pv_capacity_note": "PV output is scaled from 1 m2 generation through module power density and PV capacity.",
+        "pv_module_power_density_kw_per_m2": module_power_density,
+        "pv_capacity_note": (
+            "PV output is scaled from 1 m2 generation through module power density and PV capacity; "
+            "rooftop coverage is a derived diagnostic, not an optimization variable."
+        ),
     }
+    frame["pv_rooftop_coverage_fraction"] = frame["pv_rooftop_utilization_fraction"]
+    frame["pv_rooftop_coverage_percent"] = frame["pv_rooftop_utilization_percent"]
+    pv_meta["pv_rooftop_coverage_fraction"] = float(rooftop_utilization)
+    pv_meta["pv_rooftop_coverage_percent"] = float(rooftop_utilization * 100.0)
     return frame, pv_meta
 
 
@@ -544,7 +596,7 @@ def _pv_capacity_candidates_param(params: dict[str, Any], name: str) -> list[flo
 
 def _validate_pv_capacity_value(value: float, source: str) -> None:
     if value < 0.0:
-        raise ValueError(f"PV capacity for {source} must be >= 0 kWp, got {value}")
+        raise ValueError(f"PV capacity for {source} must be >= 0 kW, got {value}")
 
 
 def _validate_8760(df: pd.DataFrame, path: Path) -> None:

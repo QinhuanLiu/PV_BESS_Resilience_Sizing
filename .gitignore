@@ -27,6 +27,7 @@ data/
 results/
 outputs/
 figures/
+!src/figures/
 reports/generated/
 
 # OS and editor files

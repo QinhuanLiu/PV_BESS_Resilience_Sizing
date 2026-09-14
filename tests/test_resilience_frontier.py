@@ -8,9 +8,9 @@ import unittest
 import pandas as pd
 
 from pv_bess_sizing import run_selected
-from src.config import DEFAULT_CONFIG
-from src.data_loader import discover_input_cases, load_input_case
-from src.resilience_frontier import run_resilience_frontier
+from src.io.config import DEFAULT_CONFIG
+from src.io.data_loader import discover_input_cases, load_input_case
+from src.resilience_frontier import result_pareto_source, run_resilience_frontier
 
 
 PARAMETER_COLUMNS = [
@@ -28,6 +28,7 @@ PARAMETER_COLUMNS = [
 class ResilienceFrontierTests(unittest.TestCase):
     def _fast_config(self) -> dict[str, object]:
         config = deepcopy(DEFAULT_CONFIG)
+        config.setdefault("dispatch", {})["backend"] = "greedy"
         config["capacity_search"]["coarse_intervals"] = 1
         config["capacity_search"]["local_refine_divisions"] = 1
         config["capacity_search"]["max_upper_expansions"] = 0
@@ -58,22 +59,22 @@ class ResilienceFrontierTests(unittest.TestCase):
 
     def _parameter_rows(self) -> list[dict[str, object]]:
         rows = [
-            ("pv_capex_sgd_per_kwp", 1200, "SGD/kWp", 1200, 1200, 1, "PV unit CAPEX.", "光伏单位装机投资成本。"),
+            ("pv_capex_sgd_per_kw", 1200, "SGD/kW", 1200, 1200, 1, "PV unit CAPEX.", "光伏单位装机投资成本。"),
             ("battery_capex_sgd_per_kwh", 450, "SGD/kWh", 450, 450, 1, "Battery energy CAPEX.", "电池储能单位能量容量投资成本。"),
             ("battery_power_capex_sgd_per_kw", 180, "SGD/kW", 180, 180, 1, "Battery power CAPEX.", "电池功率转换单位投资成本。"),
             ("saidi_min_per_year", 60, "min/year", 60, 60, 1, "Annual outage duration.", "年平均停电持续时间。"),
+            ("saifi_per_year", 1, "events/year", 1, 1, 1, "Annual outage count.", "年平均停电次数。"),
             ("voll_sgd_per_kwh", 50, "SGD/kWh", 50, 50, 1, "Value of lost load.", "单位未供电电量对应的停电损失价值。"),
             ("city_name", "SG", "-", "", "", "", "City key.", "城市或地区名称。"),
             ("building_name", "UTown", "-", "", "", "", "Building key.", "建筑或建筑群名称。"),
-            ("local_refine_window_kwp", 0, "kWp", "", "", "", "PV local refinement window.", "光伏容量局部细化窗口。"),
-            ("local_refine_step_kwp", 500, "kWp", "", "", "", "PV local refinement step.", "光伏容量局部细化步长。"),
+            ("local_refine_window_kw", 0, "kW", "", "", "", "PV local refinement window.", "光伏容量局部细化窗口。"),
+            ("local_refine_step_kw", 500, "kW", "", "", "", "PV local refinement step.", "光伏容量局部细化步长。"),
             ("rooftop_area_m2", 1000, "m2", "", "", "", "Effective rooftop area available for PV.", "可安装光伏的有效屋顶面积。"),
-            ("pv_module_power_density_kwp_per_m2", 0.2, "kWp/m2", "", "", "", "PV module power density.", "单位面积光伏组件装机功率。"),
+            ("pv_module_power_density_kw_per_m2", 0.2, "kW/m2", "", "", "", "PV module power density.", "单位面积光伏组件装机功率。"),
             ("pv_om_fraction_per_year", 0.015, "fraction/year", "", "", "", "PV annual O&M.", "光伏年度运维成本占 CAPEX 比例。"),
             ("pv_project_years", 25, "years", "", "", "", "PV project life.", "光伏项目寿命。"),
             ("cooling_cop", 5.0, "-", "", "", "", "Cooling COP.", "制冷系统 COP。"),
             ("heating_cop", 3.5, "-", "", "", "", "Heating COP.", "供热系统 COP。"),
-            ("saifi_per_year", 1, "events/year", "", "", "", "Annual outage count.", "年平均停电次数。"),
             ("battery_om_fraction_per_year", 0.02, "fraction/year", "", "", "", "Battery O&M.", "电池年度运维成本占 CAPEX 比例。"),
             ("battery_max_c_rate", 0.0, "1/h", "", "", "", "Battery max C-rate.", "电池最大充放电倍率。"),
             ("battery_roundtrip_efficiency", 0.92, "fraction", "", "", "", "Battery round-trip efficiency.", "电池往返效率。"),
@@ -111,13 +112,17 @@ class ResilienceFrontierTests(unittest.TestCase):
             )
 
             candidate_columns = {
-                "pv_capacity_kwp",
+                "pv_capacity_kw",
                 "battery_energy_kwh",
-                "mean_EUE_kwh_per_year",
+                "mean_UE_kwh_per_year",
                 "mean_unserved_energy_cost_sgd_per_year",
                 "mean_outage_load_served_ratio",
-                "achieved_LOLP",
+                "mean_scenario_LOLP",
                 "chance_constraint_probability",
+                "baseline_generalized_cost_sgd_per_year",
+                "affordability_margin_sgd_per_year",
+                "cost_ratio_vs_baseline",
+                "is_affordable",
                 "annualized_battery_cost_sgd_per_year",
                 "pv_total_annual_cost_sgd_per_year",
                 "system_total_cost_sgd_per_year",
@@ -125,11 +130,15 @@ class ResilienceFrontierTests(unittest.TestCase):
             scenario_columns = {
                 "frontier_scenario_id",
                 "outage_seed",
-                "EUE_kwh_per_year",
+                "UE_kwh_per_year",
                 "outage_load_served_ratio",
                 "scenario_LOLP",
                 "unserved_energy_cost_sgd_per_year",
                 "pv_bess_system_annual_cost_sgd",
+                "baseline_generalized_cost_sgd_per_year",
+                "affordability_margin_sgd_per_year",
+                "cost_ratio_vs_baseline",
+                "is_affordable",
             }
             outage_columns = {"frontier_scenario_id", "outage_seed", "simulated_saidi_min_per_year"}
             self.assertTrue(candidate_columns.issubset(set(all_candidates.columns)))
@@ -138,6 +147,10 @@ class ResilienceFrontierTests(unittest.TestCase):
             self.assertEqual(len(all_candidates), 4)
             self.assertEqual(len(scenario_results), 4)
             self.assertIn("minimum_total_cost_design", optimal_designs["design_type"].tolist())
+            self.assertIn("affordable_backup_design", optimal_designs["design_type"].tolist())
+            affordable = optimal_designs[optimal_designs["design_type"] == "affordable_backup_design"].iloc[0]
+            self.assertTrue(bool(affordable["available"]))
+            self.assertTrue(bool(affordable["is_affordable"]))
             constrained = optimal_designs[optimal_designs["design_type"] == "reliability_constrained_design"].iloc[0]
             self.assertFalse(bool(constrained["available"]))
 
@@ -165,27 +178,75 @@ class ResilienceFrontierTests(unittest.TestCase):
             self.assertIn("SG_UTown_frontier_all_candidates", paths)
             candidates = pd.read_csv(frontier / "SG_UTown_Frontier_All_Candidates.csv")
             self.assertIn("system_total_cost_sgd_per_year", candidates.columns)
-            figure_labels = [
-                "Figure_2_Input_Profiles",
-                "Figure_3_Outage_Scenarios",
-                "Figure_4_PV_Building_Load_Mismatch",
-                "Figure_5_Battery_vs_Outage_Load_Served_Ratio",
-                "Figure_6_Battery_vs_EUE_Unserved_Cost",
-                "Figure_7_Battery_vs_System_Total_Cost",
-                "Figure_8_Battery_vs_Achieved_LOLP",
-                "Figure_9_Battery_vs_Chance_Constraint_Probability",
-                "Figure_10_Marginal_Cost_Reliability",
+            self.assertIn("battery_energy_kwh", candidates.columns)
+            self.assertIn("pv_capacity_kw", candidates.columns)
+            self.assertIn("mean_outage_load_served_ratio", candidates.columns)
+            self.assertIn("baseline_generalized_cost_sgd_per_year", candidates.columns)
+            self.assertIn("is_affordable", candidates.columns)
+            self.assertFalse(any(path.suffix == ".png" for path in frontier.iterdir()))
+
+    def test_result_pareto_source_marks_dominated_points(self) -> None:
+        candidates = pd.DataFrame(
+            [
+                {
+                    "case_key": "SG_UTown",
+                    "city_key": "SG",
+                    "building_key": "UTown",
+                    "pv_capacity_kw": 0.0,
+                    "pv_capacity_mw": 0.0,
+                    "battery_energy_kwh": 0.0,
+                    "battery_power_kw": 0.0,
+                    "battery_c_rate": 0.0,
+                    "lolp_threshold": 0.1,
+                    "mean_UE_kwh_per_year": 10.0,
+                    "mean_unserved_energy_cost_sgd_per_year": 100.0,
+                    "mean_outage_load_served_ratio": 0.9,
+                    "mean_scenario_LOLP": 0.1,
+                    "chance_constraint_probability": 1.0,
+                    "annualized_battery_cost_sgd_per_year": 0.0,
+                    "battery_om_cost_sgd_per_year": 0.0,
+                    "pv_total_annual_cost_sgd_per_year": 10.0,
+                    "annualized_pv_cost_sgd_per_year": 10.0,
+                    "pv_om_cost_sgd_per_year": 0.0,
+                    "mean_grid_cost_sgd_per_year": 90.0,
+                    "mean_private_annual_cost_sgd_per_year": 100.0,
+                    "system_total_cost_sgd_per_year": 200.0,
+                },
+                {
+                    "case_key": "SG_UTown",
+                    "city_key": "SG",
+                    "building_key": "UTown",
+                    "pv_capacity_kw": 100.0,
+                    "pv_capacity_mw": 0.1,
+                    "battery_energy_kwh": 100.0,
+                    "battery_power_kw": 0.0,
+                    "battery_c_rate": 0.0,
+                    "lolp_threshold": 0.1,
+                    "mean_UE_kwh_per_year": 20.0,
+                    "mean_unserved_energy_cost_sgd_per_year": 200.0,
+                    "mean_outage_load_served_ratio": 0.8,
+                    "mean_scenario_LOLP": 0.2,
+                    "chance_constraint_probability": 0.0,
+                    "annualized_battery_cost_sgd_per_year": 0.0,
+                    "battery_om_cost_sgd_per_year": 0.0,
+                    "pv_total_annual_cost_sgd_per_year": 20.0,
+                    "annualized_pv_cost_sgd_per_year": 20.0,
+                    "pv_om_cost_sgd_per_year": 0.0,
+                    "mean_grid_cost_sgd_per_year": 100.0,
+                    "mean_private_annual_cost_sgd_per_year": 120.0,
+                    "system_total_cost_sgd_per_year": 320.0,
+                },
             ]
-            for label in figure_labels:
-                base = frontier / f"SG_UTown_{label}"
-                self.assertTrue(base.with_suffix(".png").exists())
-                self.assertTrue(base.with_name(base.name + "_Source_Data.csv").exists())
-            figure_5_source = pd.read_csv(
-                frontier / "SG_UTown_Figure_5_Battery_vs_Outage_Load_Served_Ratio_Source_Data.csv"
-            )
-            self.assertIn("battery_energy_kwh", figure_5_source.columns)
-            self.assertIn("pv_capacity_kwp", figure_5_source.columns)
-            self.assertIn("mean_outage_load_served_ratio", figure_5_source.columns)
+        )
+        optimal = pd.DataFrame(
+            [
+                {"design_type": "minimum_total_cost_design", "available": True, **dict(candidates.iloc[0])},
+                {"design_type": "reliability_constrained_design", "available": True, **dict(candidates.iloc[0])},
+            ]
+        )
+        pareto = result_pareto_source(candidates, optimal)
+        dominated = pareto[pareto["pv_capacity_kw"].astype(float) == 100.0].iloc[0]
+        self.assertFalse(bool(dominated["is_pareto_efficient"]))
 
 
 if __name__ == "__main__":

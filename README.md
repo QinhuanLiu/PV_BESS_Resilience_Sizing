@@ -52,15 +52,16 @@ Required columns:
 parameter,base_value,unit,sensitivity_start,sensitivity_end,sensitivity_step,description,中文说明
 ```
 
-The first five rows must be the sensitivity parameters, in this exact order:
+The first six rows must be the sensitivity parameters, in this exact order:
 
-1. `pv_capex_sgd_per_kwp`
+1. `pv_capex_sgd_per_kw`
 2. `battery_capex_sgd_per_kwh`
 3. `battery_power_capex_sgd_per_kw`
 4. `saidi_min_per_year`
-5. `voll_sgd_per_kwh`
+5. `saifi_per_year`
+6. `voll_sgd_per_kwh`
 
-Only these five parameters may define `sensitivity_start`, `sensitivity_end`, and
+Only these six parameters may define `sensitivity_start`, `sensitivity_end`, and
 `sensitivity_step`. Sensitivity runs are single-factor: one parameter changes while all other
 parameters remain at baseline. Ranges are inclusive. If a step is zero/negative, or end is below
 start, validation fails.
@@ -70,24 +71,27 @@ Uncertainty analysis also requires the non-sensitivity parameters
 `uncertainty_seed_start`. It can optionally use `parallel_workers` to run outage scenarios across
 multiple processes. These are read from `Parameter.csv`, not from CLI flags.
 
-PV coverage is no longer used as a sizing variable. PV is optimized directly by installed capacity
-(`kWp`). The coarse PV and BESS capacity ranges are generated automatically from the 8760 load and
+PV rooftop coverage is not used as a sizing variable. PV is optimized directly by installed capacity
+(`kW`). The coarse PV and BESS capacity ranges are generated automatically from the 8760 load and
 1 m2 PV input, then refined near the lowest-cost region. The parameter file must include:
 
 - `rooftop_area_m2`: effective rooftop area available for PV installation.
-- `pv_module_power_density_kwp_per_m2`: PV module rated power density, e.g. `0.20 kWp/m2`.
+- `pv_module_power_density_kw_per_m2`: PV module rated power density, e.g. `0.20 kW/m2`.
 
-The old parameters `base_pv_coverage_fraction`, `pv_capacity_kwp_at_base_coverage`, and
+The old parameters `base_pv_coverage_fraction`, `pv_capacity_kw_at_base_coverage`, and
 `pv_coverage_candidates` are no longer accepted. The old manual candidate-list parameters
-`pv_capacity_kwp_candidates` and `battery_energy_kwh_candidates` are also no longer accepted in
+`pv_capacity_kw_candidates` and `battery_energy_kwh_candidates` are also no longer accepted in
 `Parameter.csv`. For each candidate PV capacity `C_pv`, the model calculates PV as:
 
 ```text
-PV_output_kWh_per_kwp = PV_output_kWh_per_m2 / pv_module_power_density_kwp_per_m2
-pv_kwh = PV_output_kWh_per_kwp * C_pv
-pv_installed_area_m2 = C_pv / pv_module_power_density_kwp_per_m2
-pv_rooftop_utilization_fraction = pv_installed_area_m2 / rooftop_area_m2
+PV_output_kWh_per_kw = PV_output_kWh_per_m2 / pv_module_power_density_kw_per_m2
+pv_kwh = PV_output_kWh_per_kw * C_pv
+pv_installed_area_m2 = C_pv / pv_module_power_density_kw_per_m2
+pv_rooftop_coverage_fraction = pv_installed_area_m2 / rooftop_area_m2
 ```
+
+`pv_rooftop_coverage_fraction` is retained only as a derived diagnostic field for rooftop-area
+analysis; it does not define the PV sizing search grid.
 
 The optimizer searches an automatically generated coarse `PV capacity x BESS energy capacity`
 matrix, expands the upper bound if the best point is on the upper edge, then builds a regular
@@ -125,9 +129,17 @@ Default output directory is `outputs/`. Each case is written under its city fold
 - `outputs/<City>/<City>_<Building>_Sensitive_Analysis/`
 - `outputs/<City>/<City>_<Building>_Uncertainty_Analysis/` when uncertainty modes are used.
 
+Baseline runs also write `Baseline_Result_Figures/`, including single-outage Figure 3 design-space
+plots at fixed PV capacities of 8, 20, and 32 MW, plus a Figure 4 annual-cost comparison between
+the no-PV/no-BESS reference and the least-cost PV-BESS design. These figures export PNG/SVG/PDF
+files with matching `_Source_Data.csv` tables.
+
 The default annualized-cost metric is `pv_bess_system_annual_cost_sgd`, which equals
-`pv_bess_private_annual_cost_sgd + unserved_energy_cost_sgd_per_year`. Flexibility-only sizing
-is still optimized without outages, but it is evaluated under the actual outage profile and VoLL.
+`pv_bess_private_annual_cost_sgd + unserved_energy_cost_sgd_per_year`. Baseline sizing reports a
+single outage-resilience optimal design under the active outage profile and VoLL assumptions.
+Per-candidate dispatch workbooks are disabled by default because writing one XLSX per capacity
+candidate is I/O intensive; enable them only when needed with
+`--save-candidate-dispatch-workbooks` or `outputs.save_candidate_dispatch_workbooks: true`.
 
 To validate baseline cases only:
 
@@ -140,7 +152,7 @@ To run only one case or one ordinary sensitivity parameter:
 ```bash
 python3 pv_bess_sizing.py --input-dir Input --case LA_UTown --analysis baseline
 python3 pv_bess_sizing.py --input-dir Input --case LA_UTown --analysis sensitivity --sensitivity-parameter voll_sgd_per_kwh
-python3 pv_bess_sizing.py --input-dir Input --city LA --analysis sensitivity --sensitivity-parameter pv_capex_sgd_per_kwp --sensitivity-parameter battery_capex_sgd_per_kwh
+python3 pv_bess_sizing.py --input-dir Input --city LA --analysis sensitivity --sensitivity-parameter pv_capex_sgd_per_kw --sensitivity-parameter battery_capex_sgd_per_kwh
 ```
 
 `--city`, `--case`, and sensitivity parameter options can be repeated. If both `--city` and
@@ -167,9 +179,8 @@ python3 pv_bess_sizing.py --input-dir Input --case SG_UTown --analysis uncertain
 python3 pv_bess_sizing.py --input-dir Input --case SG_UTown --analysis uncertainty --uncertainty-analysis sensitivity --uncertainty-sensitivity-parameter battery_capex_sgd_per_kwh
 ```
 
-For common random numbers, the same outage scenario is used to evaluate both design cases.
-`Flexibility-only` is optimized once under no-outage conditions and then re-evaluated across all
-outage scenarios. `Resilience-informed` is re-optimized separately for each outage scenario.
+Uncertainty analysis uses common outage generation settings and re-optimizes the resilience sizing
+design separately for each sampled outage scenario.
 When `parallel_workers > 1`, outage scenarios are evaluated in separate worker processes and then
 sorted back into deterministic scenario order before CSV output.
 
@@ -178,12 +189,77 @@ Main uncertainty outputs:
 - `<Case>_Uncertainty_Analysis/<Case>_Uncertainty_Baseline/`
 - `<Case>_Uncertainty_Analysis/<Case>_Uncertainty_Sensitive_Analysis/`
 - Baseline CSVs for all results, outage scenarios, and distribution summary.
-- Baseline PNG figures with matching `_Source_Data.csv` files for distributions and ECDF risk curves.
+- Baseline PNG/SVG/PDF figures with matching `_Source_Data.csv` files:
+  - `<Case>_Uncertainty_Baseline_Distribution_Violins` for total cost, PV capacity, BESS capacity,
+    UE, and scenario LOLP across the resilience-informed outage scenarios.
+  - `<Case>_Uncertainty_Baseline_Capacity_Cost_Bubble` for the PV-BESS capacity scatter, with point
+    size scaled by annualized total system cost.
 - Uncertainty sensitivity PNG figures with median lines and P10-P90 bands for annualized cost,
   BESS capacity, and PV capacity, separated into one figure per design case.
 
 The uncertainty module intentionally does not output explanatory scatter plots, regret fields,
 regret summary tables, or regret figures.
+
+### Variable uncertainty analysis
+
+Use `variable-uncertainty` when you want one configurable interface for random-outage uncertainty
+analysis. It can run any discovered input case, override the random outage count, and optionally
+apply an energy-based LOLP threshold:
+
+```bash
+python3 pv_bess_sizing.py --input-dir Input --case SG_UTown --analysis variable-uncertainty --uncertainty-scenario-count 100
+python3 pv_bess_sizing.py --input-dir Input --case SG_UTown --analysis variable-uncertainty --uncertainty-scenario-count 100 --lolp-threshold 0.10
+```
+
+When `--lolp-threshold` is omitted, each random outage scenario selects the least-cost PV/BESS
+design. When it is provided, each scenario selects the least-cost design satisfying
+`scenario_LOLP <= threshold`; infeasible scenarios are retained with `available = false`.
+The same run also evaluates all configured candidate PV/BESS pairs across the sampled outages and
+writes a cross-scenario candidate summary plus selected designs.
+
+This mode writes `outputs/<City>/<Case>_Uncertainty_Analysis/<Case>_Variable_Uncertainty/`,
+including scenario optima, outage scenarios, distribution summary, candidate-scenario results,
+candidate summary, and selected-design CSV files.
+It also exports five histogram + CDF distribution figures for total cost, optimal PV capacity,
+optimal battery capacity, unserved energy, and LOLP, plus one combined five-panel figure. To redraw
+those figures from existing CSV results without rerunning the uncertainty simulation:
+
+```bash
+python3 pv_bess_sizing.py --input-dir Input --case SG_UTown --analysis variable-uncertainty-figures
+```
+
+### Manila LOLP=0 uncertainty analysis
+
+For the Manila single-family typical year, run the 30-scenario zero-unserved-energy uncertainty
+module with:
+
+```bash
+.venv/bin/python pv_bess_sizing.py --input-dir Input --analysis lolp-zero-uncertainty
+```
+
+This mode writes `outputs/Manila/Manila_SingleFamily_Uncertainty_Analysis/Manila_SingleFamily_LOLP_Zero_Uncertainty/`.
+For each random outage scenario, it selects the minimum-cost PV/BESS design satisfying
+`unserved_energy_kwh_per_year <= 1e-6`, then reports annualized cost, PV capacity, BESS energy,
+and their coefficient of variation. It also exports separate histogram-density distribution
+figures for annualized cost, PV capacity, and BESS energy.
+
+### Figure 2 Manila three-year LOLP=0 uncertainty analysis
+
+For Figure 2, run 30 continuous three-year Manila paths. Each path repeats the Manila
+`Manila_SingleFamily` 8760-hour typical year three times, uses a different outage realization for
+each simulated year, forces greedy dispatch, and selects the minimum mean annual cost design
+satisfying zero unserved energy across the full three-year path:
+
+```bash
+.venv/bin/python pv_bess_sizing.py --input-dir Input --analysis lolp-zero-three-year-uncertainty --dispatch-backend greedy
+```
+
+This mode writes
+`outputs/Manila/Manila_SingleFamily_Uncertainty_Analysis/Manila_SingleFamily_Figure2_LOLP_Zero_Three_Year_Uncertainty/`.
+PV and BESS fixed costs remain annualized; three-year grid energy cost, unserved-energy cost, and
+cycle aging are averaged per year before computing the reported annualized cost. It exports 30
+optimal designs, 90 year-level outage scenario rows, a CV summary, and three histogram-density
+distribution figures for annualized cost, PV capacity, and BESS energy.
 
 ## Resilience Frontier Figures
 
@@ -193,27 +269,20 @@ future extension because they require an additional two-dimensional computationa
 
 ## Full-Load Resilience Framework
 
-The new two-stage framework uses the full electric-equivalent building load as the outage service
+The frontier-based framework uses the full electric-equivalent building load as the outage service
 target. It does not split load into critical and non-critical portions, and it does not use load
 priority classes.
 
-Stage 1 builds the PV/BESS cost-reliability frontier:
+Reliability metrics use an energy-based LOLP definition. For one outage scenario,
+`scenario_LOLP` is `UE_kWh / total outage-weighted electric-equivalent building load`; therefore
+`outage_load_served_ratio` is retained as an auxiliary audit field and equals `1 - scenario_LOLP`
+for that scenario. Across stochastic outage scenarios, `mean_scenario_LOLP` is the mean scenario LOLP,
+and `chance_constraint_probability` is the share of scenarios with `scenario_LOLP <= lolp_threshold`.
+
+Build the PV/BESS cost-reliability frontier with:
 
 ```bash
 python3 pv_bess_sizing.py --input-dir Input --case SG_UTown --analysis frontier
-```
-
-Stage 2 fixes a frontier reference design and sweeps the operational battery reserve level under
-the case's representative TOU tariff:
-
-```bash
-python3 pv_bess_sizing.py --input-dir Input --case SG_UTown --analysis reserve
-```
-
-Run both stages in order with:
-
-```bash
-python3 pv_bess_sizing.py --input-dir Input --case SG_UTown --analysis framework
 ```
 
 Run the lightweight representative single-scenario sensitivity figures with:
@@ -222,31 +291,18 @@ Run the lightweight representative single-scenario sensitivity figures with:
 python3 pv_bess_sizing.py --input-dir Input --case SG_UTown --analysis representative-sensitivity
 ```
 
-Frontier outputs are written to `outputs/<City>/<Case>_Resilience_Frontier/`. Reserve sensitivity
-outputs are written to `outputs/<City>/<Case>_Reserve_Sensitivity/` and include:
-
-- `<Case>_Reserve_Sensitivity_All_Results.csv`
-- `<Case>_Reserve_Sensitivity_Cost_Components.csv`
-- `<Case>_Reserve_Sensitivity_Reliability_Metrics.csv`
-- `<Case>_Reserve_Sensitivity_Marginal_Cost.csv`
-- Figure 13-15 PNG files with matching `_Source_Data.csv` files.
-
-Reserve sensitivity reports normal-operation bill cost, outage unserved-energy cost, net cost,
-EUE, achieved LOLP, chance-constraint probability, outage load served ratio, and adjacent reserve
-level marginal net-cost changes. If Stage 1 frontier outputs are missing, `--analysis reserve`
-generates them before running Stage 2.
+Frontier outputs are written to `outputs/<City>/<Case>_Resilience_Frontier/` and include candidate
+metrics, scenario-level frontier results, selected optimal designs, outage scenarios, and the
+frontier figures with matching `_Source_Data.csv` files.
 
 Representative sensitivity outputs are written to
 `outputs/<City>/<Case>_Representative_Sensitivity/` and include:
 
 - `<Case>_Representative_Sensitivity_All_Results.csv`
 - `<Case>_Representative_Sensitivity_Cost_Reliability.csv`
-- `<Case>_Representative_Sensitivity_Reserve_Change.csv`
-- Figure 1, Figure 11, Figure 12, and Figure 16 PNG files with matching `_Source_Data.csv` files.
+- Figure outputs with matching `_Source_Data.csv` files when those figures are generated.
 
 Figure 1 summarizes the research framework. Figure 11 evaluates fixed-design PV and battery CAPEX
-sensitivity. Figure 12 evaluates a deterministic SAIDI-VoLL sensitivity grid. Figure 16 follows
-the logic of the reserve-change plot in the referenced tariff-resilience study by reporting the
-net-cost change when reserve is increased from 20% to 80%. These representative sensitivity
-figures use one typical outage scenario and fixed PV-BESS capacity; they should not be interpreted
-as replacements for the 100-scenario frontier results.
+sensitivity. Figure 12 evaluates a deterministic SAIDI-VoLL sensitivity grid. These representative
+sensitivity figures use one typical outage scenario and fixed PV-BESS capacity; they should not be
+interpreted as replacements for the 100-scenario frontier results.

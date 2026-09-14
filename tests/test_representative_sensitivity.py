@@ -8,8 +8,8 @@ import unittest
 import pandas as pd
 
 from pv_bess_sizing import run_selected
-from src.config import DEFAULT_CONFIG
-from src.data_loader import discover_input_cases, load_input_case
+from src.io.config import DEFAULT_CONFIG
+from src.io.data_loader import discover_input_cases, load_input_case
 from src.representative_sensitivity import representative_outage_seed, run_representative_sensitivity
 from src.resilience_frontier import run_resilience_frontier
 
@@ -29,6 +29,7 @@ PARAMETER_COLUMNS = [
 class RepresentativeSensitivityTests(unittest.TestCase):
     def _fast_config(self) -> dict[str, object]:
         config = deepcopy(DEFAULT_CONFIG)
+        config.setdefault("dispatch", {})["backend"] = "greedy"
         config["capacity_search"]["coarse_intervals"] = 1
         config["capacity_search"]["local_refine_divisions"] = 1
         config["capacity_search"]["max_upper_expansions"] = 0
@@ -56,22 +57,22 @@ class RepresentativeSensitivityTests(unittest.TestCase):
 
     def _parameter_rows(self) -> list[dict[str, object]]:
         rows = [
-            ("pv_capex_sgd_per_kwp", 1200, "SGD/kWp", 1200, 1200, 1, "PV unit CAPEX.", "光伏单位装机投资成本。"),
+            ("pv_capex_sgd_per_kw", 1200, "SGD/kW", 1200, 1200, 1, "PV unit CAPEX.", "光伏单位装机投资成本。"),
             ("battery_capex_sgd_per_kwh", 450, "SGD/kWh", 450, 450, 1, "Battery energy CAPEX.", "电池储能单位能量容量投资成本。"),
             ("battery_power_capex_sgd_per_kw", 180, "SGD/kW", 180, 180, 1, "Battery power CAPEX.", "电池功率转换单位投资成本。"),
             ("saidi_min_per_year", 60, "min/year", 60, 60, 1, "Annual outage duration.", "年平均停电持续时间。"),
+            ("saifi_per_year", 1, "events/year", 1, 1, 1, "Annual outage count.", "年平均停电次数。"),
             ("voll_sgd_per_kwh", 50, "SGD/kWh", 50, 50, 1, "Value of lost load.", "单位未供电电量对应的停电损失价值。"),
             ("city_name", "SG", "-", "", "", "", "City key.", "城市或地区名称。"),
             ("building_name", "UTown", "-", "", "", "", "Building key.", "建筑或建筑群名称。"),
-            ("local_refine_window_kwp", 0, "kWp", "", "", "", "PV local refinement window.", "光伏容量局部细化窗口。"),
-            ("local_refine_step_kwp", 500, "kWp", "", "", "", "PV local refinement step.", "光伏容量局部细化步长。"),
+            ("local_refine_window_kw", 0, "kW", "", "", "", "PV local refinement window.", "光伏容量局部细化窗口。"),
+            ("local_refine_step_kw", 500, "kW", "", "", "", "PV local refinement step.", "光伏容量局部细化步长。"),
             ("rooftop_area_m2", 1000, "m2", "", "", "", "Effective rooftop area available for PV.", "可安装光伏的有效屋顶面积。"),
-            ("pv_module_power_density_kwp_per_m2", 0.2, "kWp/m2", "", "", "", "PV module power density.", "单位面积光伏组件装机功率。"),
+            ("pv_module_power_density_kw_per_m2", 0.2, "kW/m2", "", "", "", "PV module power density.", "单位面积光伏组件装机功率。"),
             ("pv_om_fraction_per_year", 0.015, "fraction/year", "", "", "", "PV annual O&M.", "光伏年度运维成本占 CAPEX 比例。"),
             ("pv_project_years", 25, "years", "", "", "", "PV project life.", "光伏项目寿命。"),
             ("cooling_cop", 5.0, "-", "", "", "", "Cooling COP.", "制冷系统 COP。"),
             ("heating_cop", 3.5, "-", "", "", "", "Heating COP.", "供热系统 COP。"),
-            ("saifi_per_year", 1, "events/year", "", "", "", "Annual outage count.", "年平均停电次数。"),
             ("battery_om_fraction_per_year", 0.02, "fraction/year", "", "", "", "Battery O&M.", "电池年度运维成本占 CAPEX 比例。"),
             ("battery_max_c_rate", 0.5, "1/h", "", "", "", "Battery max C-rate.", "电池最大充放电倍率。"),
             ("battery_roundtrip_efficiency", 0.92, "fraction", "", "", "", "Battery round-trip efficiency.", "电池往返效率。"),
@@ -104,7 +105,7 @@ class RepresentativeSensitivityTests(unittest.TestCase):
             _, _, cfg, parameters = load_input_case(case, self._fast_config())
             self.assertEqual(representative_outage_seed(parameters, cfg), 1000)
             _, _, optimal_designs, _ = run_resilience_frontier(case, cfg, parameters)
-            all_results, cost_reliability, reserve_change = run_representative_sensitivity(
+            all_results, cost_reliability = run_representative_sensitivity(
                 case,
                 cfg,
                 parameters,
@@ -112,17 +113,15 @@ class RepresentativeSensitivityTests(unittest.TestCase):
             )
             self.assertFalse(all_results.empty)
             self.assertFalse(cost_reliability.empty)
-            self.assertEqual(len(reserve_change), 7)
-            self.assertEqual(all_results["reference_pv_capacity_kwp"].nunique(), 1)
+            self.assertEqual(all_results["reference_pv_capacity_kw"].nunique(), 1)
             self.assertEqual(all_results["reference_battery_energy_kwh"].nunique(), 1)
-            capex = all_results[all_results["sensitivity_parameter"] == "pv_capex_sgd_per_kwp"]
+            capex = all_results[all_results["sensitivity_parameter"] == "pv_capex_sgd_per_kw"]
             self.assertEqual(sorted(capex["sensitivity_multiplier"].unique().tolist()), [0.5, 0.75, 1.0, 1.25, 1.5, 2.0])
-            base_pv_cost = float(cfg["pv"]["capex_sgd_per_kwp"])
+            base_pv_cost = float(cfg["pv"]["capex_sgd_per_kw"])
             self.assertIn(base_pv_cost * 2.0, capex["sensitivity_value"].tolist())
             saidi_voll = all_results[all_results["sensitivity_family"] == "saidi_voll"]
             self.assertIn(10.0, saidi_voll["voll_multiplier"].tolist())
             self.assertIn(10.0, saidi_voll["saidi_multiplier"].tolist())
-            self.assertIn("delta_net_cost_sgd_per_year", reserve_change.columns)
 
     def test_run_selected_writes_representative_sensitivity_outputs(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -138,29 +137,21 @@ class RepresentativeSensitivityTests(unittest.TestCase):
                 run_uncertainty_baseline=False,
                 run_uncertainty_sensitivity=False,
                 run_frontier=False,
-                run_reserve=False,
                 run_representative_sensitivity=True,
                 case_filters=["SG_UTown"],
             )
             sensitivity = output_dir / "SG" / "SG_UTown_Representative_Sensitivity"
             self.assertTrue((sensitivity / "SG_UTown_Representative_Sensitivity_All_Results.csv").exists())
             self.assertTrue((sensitivity / "SG_UTown_Representative_Sensitivity_Cost_Reliability.csv").exists())
-            self.assertTrue((sensitivity / "SG_UTown_Representative_Sensitivity_Reserve_Change.csv").exists())
-            for label in (
-                "Figure_1_Research_Framework",
-                "Figure_11_CAPEX_Sensitivity",
-                "Figure_12_SAIDI_VoLL_Heatmap",
-                "Figure_16_Reserve_Change_Sensitivity",
-            ):
-                base = sensitivity / f"SG_UTown_{label}"
-                self.assertTrue(base.with_suffix(".png").exists())
-                self.assertTrue(base.with_name(base.name + "_Source_Data.csv").exists())
-            figure_16_source = pd.read_csv(
-                sensitivity / "SG_UTown_Figure_16_Reserve_Change_Sensitivity_Source_Data.csv"
+            csv_names = sorted(path.name for path in sensitivity.glob("*.csv"))
+            self.assertEqual(
+                csv_names,
+                [
+                    "SG_UTown_Representative_Sensitivity_All_Results.csv",
+                    "SG_UTown_Representative_Sensitivity_Cost_Reliability.csv",
+                ],
             )
-            self.assertIn("delta_net_cost_sgd_per_year", figure_16_source.columns)
-            self.assertIn("delta_bill_cost_sgd_per_year", figure_16_source.columns)
-            self.assertIn("delta_outage_unserved_cost_sgd_per_year", figure_16_source.columns)
+            self.assertFalse(any(path.suffix == ".png" for path in sensitivity.iterdir()))
             self.assertIn("SG_UTown_representative_sensitivity_all_results", paths)
 
 

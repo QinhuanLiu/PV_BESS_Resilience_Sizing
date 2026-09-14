@@ -1,25 +1,28 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
+import json
 from typing import Any, Callable
 
 import pandas as pd
 
-from .costing import baseline_no_battery_cost, pv_bess_annual_cost
-from .dispatch import outage_free_frame, solve_dispatch_greedy
+from .costing import pv_bess_annual_cost
+from .dispatch import solve_dispatch
 
 PvCapacityFrameBuilder = Callable[[float], tuple[pd.DataFrame, dict[str, float | str]]]
+DispatchKey = tuple[str, int, float, float]
+CandidateCacheKey = tuple[str, float, float]
+NoBessReferenceCacheKey = tuple[str, float]
 
 
-def scenario_config(config: dict[str, Any], scenario_key: str, resilience_informed: bool = True) -> dict[str, Any]:
+def scenario_config(config: dict[str, Any], scenario_key: str) -> dict[str, Any]:
     resolved = deepcopy(config)
     scenario = deepcopy(config["scenarios"][scenario_key])
     resolved["active_scenario"] = scenario
     resolved["active_scenario_key"] = scenario_key
     resolved["economics"] = deepcopy(config["economics"])
     resolved["economics"].update(scenario.get("battery_economics", {}))
-    if not resilience_informed:
-        resolved["active_scenario"]["voll_sgd_per_kwh"] = 0.0
     return resolved
 
 
@@ -33,75 +36,231 @@ def battery_sizing(energy_kwh: float, config: dict[str, Any]) -> dict[str, float
     }
 
 
+class CandidateStore:
+    def __init__(self, retain_dispatch: bool = True) -> None:
+        self.retain_dispatch = retain_dispatch
+        self._results: dict[CandidateCacheKey, dict[str, Any]] = {}
+        self._dispatches: dict[CandidateCacheKey, pd.DataFrame] = {}
+        self._no_bess_references: dict[NoBessReferenceCacheKey, dict[str, Any]] = {}
+
+    def get(
+        self,
+        key: CandidateCacheKey,
+        require_dispatch: bool,
+    ) -> tuple[dict[str, Any], pd.DataFrame | None] | None:
+        if key not in self._results:
+            return None
+        if require_dispatch and key not in self._dispatches:
+            return None
+        result = dict(self._results[key])
+        dispatch = self._dispatches[key].copy() if key in self._dispatches else None
+        return result, dispatch
+
+    def set(self, key: CandidateCacheKey, result: dict[str, Any], dispatch: pd.DataFrame) -> None:
+        self._results[key] = dict(result)
+        if self.retain_dispatch:
+            self._dispatches[key] = dispatch.copy()
+
+    def get_no_bess_reference(self, key: NoBessReferenceCacheKey) -> dict[str, Any] | None:
+        if key not in self._no_bess_references:
+            return None
+        return dict(self._no_bess_references[key])
+
+    def set_no_bess_reference(self, key: NoBessReferenceCacheKey, reference: dict[str, Any]) -> None:
+        self._no_bess_references[key] = dict(reference)
+
+
+class CandidateEvaluator:
+    def __init__(self, config: dict[str, Any], store: CandidateStore | None = None) -> None:
+        self.config = config
+        self.store = store or CandidateStore(retain_dispatch=True)
+
+    def evaluate(
+        self,
+        frame: pd.DataFrame,
+        battery_energy_kwh: float,
+        pv_meta: dict[str, float | str],
+        require_dispatch: bool = True,
+    ) -> tuple[dict[str, Any], pd.DataFrame | None]:
+        key = _candidate_cache_key(frame, battery_energy_kwh, pv_meta, self.config)
+        cached = self.store.get(key, require_dispatch=require_dispatch)
+        if cached is not None:
+            return cached
+        reference_key = _no_bess_reference_cache_key(frame, pv_meta, self.config)
+        no_bess_reference = self.store.get_no_bess_reference(reference_key)
+        result, dispatch = evaluate_candidate(
+            frame,
+            battery_energy_kwh,
+            pv_meta,
+            self.config,
+            no_bess_reference=no_bess_reference,
+        )
+        self.store.set(key, result, dispatch)
+        self.store.set_no_bess_reference(reference_key, _no_bess_reference_from_result(result))
+        return dict(result), dispatch.copy() if require_dispatch else None
+
+
+def _candidate_cache_key(
+    frame: pd.DataFrame,
+    battery_energy_kwh: float,
+    pv_meta: dict[str, float | str],
+    config: dict[str, Any],
+) -> CandidateCacheKey:
+    return (
+        _evaluation_context_hash(frame, pv_meta, config),
+        round(float(pv_meta["pv_capacity_kw"]), 6),
+        round(float(battery_energy_kwh), 6),
+    )
+
+
+def _no_bess_reference_cache_key(
+    frame: pd.DataFrame,
+    pv_meta: dict[str, float | str],
+    config: dict[str, Any],
+) -> NoBessReferenceCacheKey:
+    return (
+        _evaluation_context_hash(frame, pv_meta, config),
+        round(float(pv_meta["pv_capacity_kw"]), 6),
+    )
+
+
+def _evaluation_context_hash(frame: pd.DataFrame, pv_meta: dict[str, float | str], config: dict[str, Any]) -> str:
+    return _hash_payload(
+        {
+            "frame": _frame_hash(frame),
+            "config": _evaluation_config_signature(config),
+            "pv_meta": _jsonable(pv_meta),
+        }
+    )
+
+
+def _frame_hash(frame: pd.DataFrame) -> str:
+    hashed = pd.util.hash_pandas_object(frame, index=True).to_numpy(dtype="uint64")
+    digest = hashlib.sha256()
+    digest.update(",".join(str(column) for column in frame.columns).encode("utf-8"))
+    digest.update(hashed.tobytes())
+    return digest.hexdigest()
+
+
+def _evaluation_config_signature(config: dict[str, Any]) -> dict[str, Any]:
+    pv = config.get("pv", {})
+    return {
+        "active_scenario": _jsonable(config.get("active_scenario", {})),
+        "active_scenario_key": config.get("active_scenario_key"),
+        "battery": _jsonable(config.get("battery", {})),
+        "dispatch": _jsonable(config.get("dispatch", {})),
+        "economics": _jsonable(config.get("economics", {})),
+        "technical": _jsonable(config.get("technical", {})),
+        "pv": _jsonable(
+            {
+                "capex_sgd_per_kw": pv.get("capex_sgd_per_kw"),
+                "om_fraction_per_year": pv.get("om_fraction_per_year"),
+                "project_years": pv.get("project_years"),
+                "module_power_density_kw_per_m2": pv.get("module_power_density_kw_per_m2"),
+                "rooftop_area_m2": pv.get("rooftop_area_m2"),
+            }
+        ),
+    }
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _jsonable(value[key]) for key in sorted(value)}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if hasattr(value, "item"):
+        return value.item()
+    return value
+
+
+def _hash_payload(payload: Any) -> str:
+    return hashlib.sha256(json.dumps(_jsonable(payload), sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
 def evaluate_candidate(
     frame: pd.DataFrame,
     battery_energy_kwh: float,
     pv_meta: dict[str, float | str],
     config: dict[str, Any],
+    no_bess_reference: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
     sizing = battery_sizing(battery_energy_kwh, config)
-    dispatch = solve_dispatch_greedy(frame, sizing, config)
-    baseline = baseline_no_battery_cost(frame, pv_meta, config)
+    dispatch = solve_dispatch(frame, sizing, config)
     pv_bess = pv_bess_annual_cost(frame, dispatch, sizing, pv_meta, config)
+    if no_bess_reference is None:
+        no_bess_reference = (
+            _no_bess_reference_from_pv_bess_cost(pv_bess)
+            if abs(float(battery_energy_kwh)) <= 1e-9
+            else _zero_battery_reference(frame, pv_meta, config)
+        )
     result = {
         **sizing,
-        **baseline,
+        **no_bess_reference,
         **pv_bess,
-        "avoided_unserved_energy_kwh_per_year": (
-            baseline["baseline_unserved_energy_kwh_per_year"] - pv_bess["unserved_energy_kwh_per_year"]
+        "dispatch_backend": str(dispatch["dispatch_backend"].iloc[0]) if "dispatch_backend" in dispatch.columns else "unknown",
+        "solver_status": str(dispatch["solver_status"].iloc[0]) if "solver_status" in dispatch.columns else "",
+        "milp_objective_sgd": (
+            float(dispatch["milp_objective_sgd"].iloc[0]) if "milp_objective_sgd" in dispatch.columns and pd.notna(dispatch["milp_objective_sgd"].iloc[0]) else pd.NA
         ),
-        "system_annual_cost_delta_vs_baseline_sgd": (
-            pv_bess["pv_bess_system_annual_cost_sgd"] - baseline["baseline_system_annual_cost_sgd"]
+        "degradation_penalty_sgd_per_kwh": (
+            float(dispatch["degradation_penalty_sgd_per_kwh"].iloc[0])
+            if "degradation_penalty_sgd_per_kwh" in dispatch.columns
+            else 0.0
+        ),
+        "simultaneous_charge_discharge_kwh": (
+            float(dispatch["simultaneous_charge_discharge_kwh"].sum())
+            if "simultaneous_charge_discharge_kwh" in dispatch.columns
+            else 0.0
+        ),
+        "avoided_unserved_energy_kwh_per_year": (
+            no_bess_reference["no_bess_reference_unserved_energy_kwh_per_year"]
+            - pv_bess["unserved_energy_kwh_per_year"]
+        ),
+        "system_annual_cost_delta_vs_no_bess_reference_sgd": (
+            pv_bess["pv_bess_system_annual_cost_sgd"]
+            - no_bess_reference["no_bess_reference_system_annual_cost_sgd"]
         ),
     }
     return result, dispatch
 
 
-def optimize_battery(
-    frame: pd.DataFrame,
-    pv_meta: dict[str, float | str],
-    config: dict[str, Any],
-    candidates: list[float] | None = None,
-    row_metadata: dict[str, Any] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    values = [float(x) for x in (candidates or config["battery"]["energy_kwh_candidates"])]
-    rows: list[dict[str, Any]] = []
-    dispatch_by_energy: dict[float, pd.DataFrame] = {}
-    metadata = row_metadata or {}
-    for value in values:
-        result, dispatch = evaluate_candidate(frame, value, pv_meta, config)
-        result.update(metadata)
-        rows.append(result)
-        dispatch_by_energy[value] = dispatch
-    summary = pd.DataFrame(rows).sort_values("pv_bess_system_annual_cost_sgd").reset_index(drop=True)
-    best_energy = float(summary.iloc[0]["battery_energy_kwh"])
-    return summary, dispatch_by_energy[best_energy], dict(summary.iloc[0])
+def _zero_battery_reference(frame: pd.DataFrame, pv_meta: dict[str, float | str], config: dict[str, Any]) -> dict[str, Any]:
+    zero_sizing = battery_sizing(0.0, config)
+    zero_dispatch = solve_dispatch(frame, zero_sizing, config)
+    zero_cost = pv_bess_annual_cost(frame, zero_dispatch, zero_sizing, pv_meta, config)
+    return _no_bess_reference_from_pv_bess_cost(zero_cost)
 
 
-def optimize_battery_with_refinement(
-    frame: pd.DataFrame,
-    pv_meta: dict[str, float | str],
-    config: dict[str, Any],
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    coarse, _, coarse_best = optimize_battery(frame, pv_meta, config, row_metadata={"search_stage": "coarse", "search_iteration": 0})
-    anchor = float(coarse_best["battery_energy_kwh"])
-    window = float(config["battery"]["local_refine_window_kwh"])
-    step = float(config["battery"]["local_refine_step_kwh"])
-    start = max(0.0, anchor - window)
-    end = max(start, anchor + window)
-    count = int(round((end - start) / step))
-    refined_values = sorted(set(round(start + i * step, 6) for i in range(count + 1)) | {anchor})
-    refined, dispatch, best = optimize_battery(
-        frame,
-        pv_meta,
-        config,
-        refined_values,
-        row_metadata={"search_stage": "optimal_region", "search_iteration": 0},
-    )
-    combined = pd.concat([coarse, refined], ignore_index=True)
-    combined = combined.drop_duplicates(subset=["battery_energy_kwh"], keep="last")
-    combined = combined.sort_values("pv_bess_system_annual_cost_sgd").reset_index(drop=True)
-    return combined, dispatch, best
+def _no_bess_reference_from_pv_bess_cost(pv_bess: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "no_bess_reference_grid_energy_kwh": float(pv_bess["pv_bess_grid_energy_kwh"]),
+        "no_bess_reference_grid_cost_sgd": float(pv_bess["pv_bess_grid_cost_sgd"]),
+        "no_bess_reference_private_annual_cost_sgd": float(pv_bess["pv_bess_private_annual_cost_sgd"]),
+        "no_bess_reference_unserved_energy_kwh_per_year": float(pv_bess["unserved_energy_kwh_per_year"]),
+        "no_bess_reference_unserved_energy_cost_sgd_per_year": float(
+            pv_bess["unserved_energy_cost_sgd_per_year"]
+        ),
+        "no_bess_reference_system_annual_cost_sgd": float(pv_bess["pv_bess_system_annual_cost_sgd"]),
+    }
+
+
+def _no_bess_reference_from_result(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "no_bess_reference_grid_energy_kwh": float(result["no_bess_reference_grid_energy_kwh"]),
+        "no_bess_reference_grid_cost_sgd": float(result["no_bess_reference_grid_cost_sgd"]),
+        "no_bess_reference_private_annual_cost_sgd": float(
+            result["no_bess_reference_private_annual_cost_sgd"]
+        ),
+        "no_bess_reference_unserved_energy_kwh_per_year": float(
+            result["no_bess_reference_unserved_energy_kwh_per_year"]
+        ),
+        "no_bess_reference_unserved_energy_cost_sgd_per_year": float(
+            result["no_bess_reference_unserved_energy_cost_sgd_per_year"]
+        ),
+        "no_bess_reference_system_annual_cost_sgd": float(
+            result["no_bess_reference_system_annual_cost_sgd"]
+        ),
+    }
 
 
 def _refined_values(anchor: float, window: float, step: float) -> list[float]:
@@ -140,45 +299,105 @@ def _is_axis_edge(value: float, values: list[float]) -> bool:
     return abs(value_f - axis[0]) <= 1e-6 or abs(value_f - axis[-1]) <= 1e-6
 
 
+def _dispatch_key(search_stage: str, search_iteration: int, pv_capacity_kw: float, battery_energy_kwh: float) -> DispatchKey:
+    return (
+        str(search_stage),
+        int(search_iteration),
+        round(float(pv_capacity_kw), 6),
+        round(float(battery_energy_kwh), 6),
+    )
+
+
+def _evaluate_candidate_grid(
+    pv_capacity_frame_builder: PvCapacityFrameBuilder,
+    pv_values: list[float],
+    battery_values: list[float],
+    config: dict[str, Any],
+    search_stage: str,
+    search_iteration: int,
+    evaluator: CandidateEvaluator | None = None,
+) -> tuple[pd.DataFrame, dict[DispatchKey, pd.DataFrame]]:
+    rows: list[dict[str, Any]] = []
+    dispatch_store: dict[DispatchKey, pd.DataFrame] = {}
+    active_evaluator = evaluator or CandidateEvaluator(config)
+    for pv_capacity in sorted({float(value) for value in pv_values}):
+        frame, pv_meta = pv_capacity_frame_builder(float(pv_capacity))
+        for battery_energy in sorted({float(value) for value in battery_values}):
+            result, dispatch = active_evaluator.evaluate(frame, float(battery_energy), pv_meta, require_dispatch=True)
+            if dispatch is None:
+                raise ValueError("Candidate evaluator did not return dispatch for grid search")
+            result.update({"search_stage": search_stage, "search_iteration": int(search_iteration)})
+            rows.append(result)
+            key = _dispatch_key(search_stage, int(search_iteration), result["pv_capacity_kw"], result["battery_energy_kwh"])
+            annotated_dispatch = dispatch.copy()
+            annotated_dispatch["search_stage"] = search_stage
+            annotated_dispatch["search_iteration"] = int(search_iteration)
+            annotated_dispatch["pv_capacity_kw"] = float(result["pv_capacity_kw"])
+            annotated_dispatch["battery_energy_kwh"] = float(result["battery_energy_kwh"])
+            dispatch_store[key] = annotated_dispatch
+    summary = pd.DataFrame(rows).sort_values("pv_bess_system_annual_cost_sgd").reset_index(drop=True)
+    return summary, dispatch_store
+
+
 def optimize_pv_battery_with_refinement(
     pv_capacity_frame_builder: PvCapacityFrameBuilder,
     config: dict[str, Any],
+    evaluator: CandidateEvaluator | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    pv_candidates = [float(value) for value in config["pv"]["capacity_kwp_candidates"]]
+    all_rows, dispatch_store, best = optimize_pv_battery_with_refinement_with_dispatches(
+        pv_capacity_frame_builder,
+        config,
+        evaluator=evaluator,
+    )
+    key = _dispatch_key(
+        str(best["search_stage"]),
+        int(best["search_iteration"]),
+        float(best["pv_capacity_kw"]),
+        float(best["battery_energy_kwh"]),
+    )
+    return all_rows, dispatch_store[key].copy(), best
+
+
+def optimize_pv_battery_with_refinement_with_dispatches(
+    pv_capacity_frame_builder: PvCapacityFrameBuilder,
+    config: dict[str, Any],
+    evaluator: CandidateEvaluator | None = None,
+) -> tuple[pd.DataFrame, dict[DispatchKey, pd.DataFrame], dict[str, Any]]:
+    pv_candidates = [float(value) for value in config["pv"]["capacity_kw_candidates"]]
     battery_candidates = [float(value) for value in config["battery"]["energy_kwh_candidates"]]
     search_cfg = config.get("capacity_search", {})
     expansion_factor = float(search_cfg.get("upper_expansion_factor", 1.5))
     max_upper_expansions = int(search_cfg.get("max_upper_expansions", 2))
     refine_divisions = max(1.0, float(search_cfg.get("local_refine_divisions", 6)))
     coarse_history: list[pd.DataFrame] = []
+    dispatch_store: dict[DispatchKey, pd.DataFrame] = {}
+    active_evaluator = evaluator or CandidateEvaluator(config)
     coarse_best: dict[str, Any] = {}
     final_coarse_iteration = 0
     for iteration in range(max_upper_expansions + 1):
-        rows: list[pd.DataFrame] = []
-        for pv_capacity in pv_candidates:
-            frame, pv_meta = pv_capacity_frame_builder(float(pv_capacity))
-            summary, _, _ = optimize_battery(
-                frame,
-                pv_meta,
-                config,
-                battery_candidates,
-                row_metadata={"search_stage": "coarse", "search_iteration": iteration},
-            )
-            rows.append(summary)
-        coarse = pd.concat(rows, ignore_index=True)
+        coarse, coarse_dispatches = _evaluate_candidate_grid(
+            pv_capacity_frame_builder,
+            pv_candidates,
+            battery_candidates,
+            config,
+            search_stage="coarse",
+            search_iteration=iteration,
+            evaluator=active_evaluator,
+        )
+        dispatch_store.update(coarse_dispatches)
         coarse = coarse.sort_values("pv_bess_system_annual_cost_sgd").reset_index(drop=True)
         coarse_history.append(coarse)
         coarse_best = dict(coarse.iloc[0])
-        expand_pv = _is_upper_boundary(float(coarse_best["pv_capacity_kwp"]), pv_candidates)
+        expand_pv = _is_upper_boundary(float(coarse_best["pv_capacity_kw"]), pv_candidates)
         expand_battery = _is_upper_boundary(float(coarse_best["battery_energy_kwh"]), battery_candidates)
         final_coarse_iteration = iteration
         if iteration >= max_upper_expansions or not (expand_pv or expand_battery):
             break
         if expand_pv:
             pv_candidates = _expanded_axis(pv_candidates, factor=expansion_factor)
-            config["pv"]["capacity_kwp_candidates"] = pv_candidates
-            config["pv"]["local_refine_window_kwp"] = pv_candidates[1] - pv_candidates[0]
-            config["pv"]["local_refine_step_kwp"] = max((pv_candidates[1] - pv_candidates[0]) / refine_divisions, 1e-6)
+            config["pv"]["capacity_kw_candidates"] = pv_candidates
+            config["pv"]["local_refine_window_kw"] = pv_candidates[1] - pv_candidates[0]
+            config["pv"]["local_refine_step_kw"] = max((pv_candidates[1] - pv_candidates[0]) / refine_divisions, 1e-6)
         if expand_battery:
             battery_candidates = _expanded_axis(battery_candidates, factor=expansion_factor)
             config["battery"]["energy_kwh_candidates"] = battery_candidates
@@ -186,15 +405,15 @@ def optimize_pv_battery_with_refinement(
             config["battery"]["local_refine_step_kwh"] = max((battery_candidates[1] - battery_candidates[0]) / refine_divisions, 1e-6)
 
     coarse = coarse_history[-1]
-    best_pv_capacity = float(coarse_best["pv_capacity_kwp"])
+    best_pv_capacity = float(coarse_best["pv_capacity_kw"])
     best_battery = float(coarse_best["battery_energy_kwh"])
     refined_history: list[pd.DataFrame] = []
     refined: pd.DataFrame | None = None
     for iteration in range(2):
         refined_pv_values = _refined_values(
             best_pv_capacity,
-            float(config["pv"]["local_refine_window_kwp"]),
-            float(config["pv"]["local_refine_step_kwp"]),
+            float(config["pv"]["local_refine_window_kw"]),
+            float(config["pv"]["local_refine_step_kw"]),
         )
         refined_battery_values = _refined_values(
             best_battery,
@@ -203,21 +422,22 @@ def optimize_pv_battery_with_refinement(
         )
 
         refined_rows: list[pd.DataFrame] = []
-        for pv_capacity in refined_pv_values:
-            refine_frame, refine_pv_meta = pv_capacity_frame_builder(float(pv_capacity))
-            local_refined, _, _ = optimize_battery(
-                refine_frame,
-                refine_pv_meta,
-                config,
-                refined_battery_values,
-                row_metadata={"search_stage": "optimal_region", "search_iteration": iteration},
-            )
-            refined_rows.append(local_refined)
+        local_refined, refined_dispatches = _evaluate_candidate_grid(
+            pv_capacity_frame_builder,
+            refined_pv_values,
+            refined_battery_values,
+            config,
+            search_stage="optimal_region",
+            search_iteration=iteration,
+            evaluator=active_evaluator,
+        )
+        dispatch_store.update(refined_dispatches)
+        refined_rows.append(local_refined)
         refined = pd.concat(refined_rows, ignore_index=True)
         refined = refined.sort_values("pv_bess_system_annual_cost_sgd").reset_index(drop=True)
         refined_history.append(refined)
         refined_best = dict(refined.iloc[0])
-        best_pv_capacity = float(refined_best["pv_capacity_kwp"])
+        best_pv_capacity = float(refined_best["pv_capacity_kw"])
         best_battery = float(refined_best["battery_energy_kwh"])
         if not (_is_axis_edge(best_pv_capacity, refined_pv_values) or _is_axis_edge(best_battery, refined_battery_values)):
             break
@@ -225,17 +445,15 @@ def optimize_pv_battery_with_refinement(
     if refined is None:
         raise ValueError("PV-BESS optimization failed to generate a refined candidate grid")
     combined = pd.concat([coarse, refined], ignore_index=True)
-    combined = combined.drop_duplicates(subset=["pv_capacity_kwp", "battery_energy_kwh"], keep="last")
+    combined = combined.drop_duplicates(subset=["pv_capacity_kw", "battery_energy_kwh"], keep="last")
     combined = combined.sort_values("pv_bess_system_annual_cost_sgd").reset_index(drop=True)
     best = dict(combined.iloc[0])
     best["coarse_search_iteration"] = final_coarse_iteration
     best["optimal_region_iteration"] = int(refined["search_iteration"].max())
-    best_frame, best_pv_meta = pv_capacity_frame_builder(float(best["pv_capacity_kwp"]))
-    _, dispatch = evaluate_candidate(best_frame, float(best["battery_energy_kwh"]), best_pv_meta, config)
     all_rows = pd.concat(coarse_history + refined_history, ignore_index=True)
-    all_rows = all_rows.drop_duplicates(subset=["pv_capacity_kwp", "battery_energy_kwh", "search_stage", "search_iteration"], keep="last")
+    all_rows = all_rows.drop_duplicates(subset=["pv_capacity_kw", "battery_energy_kwh", "search_stage", "search_iteration"], keep="last")
     all_rows = all_rows.sort_values("pv_bess_system_annual_cost_sgd").reset_index(drop=True)
-    return all_rows, dispatch, best
+    return all_rows, dispatch_store, best
 
 
 def surface_search(
@@ -246,12 +464,13 @@ def surface_search(
     config: dict[str, Any],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows: list[dict[str, Any]] = []
-    scenario_cfg = scenario_config(config, scenario_key, resilience_informed=True)
-    for pv_capacity in config["pv"]["capacity_kwp_candidates"]:
+    scenario_cfg = scenario_config(config, scenario_key)
+    evaluator = CandidateEvaluator(scenario_cfg, CandidateStore(retain_dispatch=False))
+    for pv_capacity in config["pv"]["capacity_kw_candidates"]:
         frame, pv_meta = frame_builder(base_frame, scenario_key, config, float(pv_capacity))
         frame = frame.merge(outage_profile, on="hour_index", how="left")
         for battery in config["battery"]["energy_kwh_candidates"]:
-            result, _ = evaluate_candidate(frame, float(battery), pv_meta, scenario_cfg)
+            result, _ = evaluator.evaluate(frame, float(battery), pv_meta, require_dispatch=False)
             rows.append(
                 {
                     "scenario": scenario_key,
@@ -260,7 +479,7 @@ def surface_search(
             )
     surface = pd.DataFrame(rows)
     matrix = surface.pivot_table(
-        index="pv_capacity_kwp",
+        index="pv_capacity_kw",
         columns="battery_energy_kwh",
         values="pv_bess_system_annual_cost_sgd",
         aggfunc="min",
@@ -268,48 +487,36 @@ def surface_search(
     return surface, matrix
 
 
-def resilience_design_pair(
+def _best_dispatch_from_store(best: dict[str, Any], dispatch_store: dict[DispatchKey, pd.DataFrame]) -> pd.DataFrame:
+    key = _dispatch_key(
+        str(best["search_stage"]),
+        int(best["search_iteration"]),
+        float(best["pv_capacity_kw"]),
+        float(best["battery_energy_kwh"]),
+    )
+    return dispatch_store[key].copy()
+
+
+def resilience_design(
     pv_capacity_frame_builder: PvCapacityFrameBuilder,
     config: dict[str, Any],
     scenario_key: str,
-) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
-    aware_cfg = scenario_config(config, scenario_key, resilience_informed=True)
-    flex_cfg = scenario_config(config, scenario_key, resilience_informed=False)
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[DispatchKey, pd.DataFrame]]:
+    sizing_cfg = scenario_config(config, scenario_key)
+    evaluator = CandidateEvaluator(sizing_cfg, CandidateStore(retain_dispatch=True))
 
-    def no_outage_builder(pv_capacity: float) -> tuple[pd.DataFrame, dict[str, float | str]]:
-        frame, pv_meta = pv_capacity_frame_builder(pv_capacity)
-        return outage_free_frame(frame), pv_meta
-
-    flex_summary, _, flex_opt_best = optimize_pv_battery_with_refinement(no_outage_builder, flex_cfg)
-    flex_frame, flex_pv_meta = pv_capacity_frame_builder(float(flex_opt_best["pv_capacity_kwp"]))
-    flex_eval, flex_dispatch = evaluate_candidate(
-        flex_frame,
-        float(flex_opt_best["battery_energy_kwh"]),
-        flex_pv_meta,
-        aware_cfg,
+    summary, dispatch_store, best = optimize_pv_battery_with_refinement_with_dispatches(
+        pv_capacity_frame_builder,
+        sizing_cfg,
+        evaluator=evaluator,
     )
-    flex_eval.update(
+    dispatch = _best_dispatch_from_store(best, dispatch_store)
+    best.update(
         {
             "scenario": scenario_key,
-            "design_case": "flexibility_only",
-            "optimization_outage_mode": "no_outage",
-            "optimization_voll_sgd_per_kwh": 0.0,
-            "evaluation_voll_sgd_per_kwh": aware_cfg["active_scenario"]["voll_sgd_per_kwh"],
-        }
-    )
-
-    aware_summary, aware_dispatch, aware_best = optimize_pv_battery_with_refinement(pv_capacity_frame_builder, aware_cfg)
-    aware_best.update(
-        {
-            "scenario": scenario_key,
-            "design_case": "resilience_informed",
             "optimization_outage_mode": "city_outage",
-            "optimization_voll_sgd_per_kwh": aware_cfg["active_scenario"]["voll_sgd_per_kwh"],
-            "evaluation_voll_sgd_per_kwh": aware_cfg["active_scenario"]["voll_sgd_per_kwh"],
+            "optimization_voll_sgd_per_kwh": sizing_cfg["active_scenario"]["voll_sgd_per_kwh"],
+            "evaluation_voll_sgd_per_kwh": sizing_cfg["active_scenario"]["voll_sgd_per_kwh"],
         }
     )
-
-    long_rows = pd.DataFrame([flex_eval, aware_best])
-    dispatches = {"flexibility_only": flex_dispatch, "resilience_informed": aware_dispatch}
-    summaries = {"flexibility_only": flex_summary, "resilience_informed": aware_summary}
-    return long_rows, dispatches, summaries
+    return pd.DataFrame([best]), dispatch, summary, dispatch_store

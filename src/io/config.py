@@ -12,7 +12,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pv_csv": None,
         "tou_csv": None,
     },
-    "outputs": {"directory": "outputs"},
+    "outputs": {
+        "directory": "outputs",
+        "save_candidate_dispatch_workbooks": False,
+    },
+    "dispatch": {
+        "backend": "auto",
+        "solver": "HiGHS",
+        "include_degradation_penalty": True,
+    },
     "capacity_search": {
         "coarse_intervals": 8,
         "local_refine_divisions": 6,
@@ -27,12 +35,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pv_during_outage_available": True,
     },
     "pv": {
-        "capacity_kwp_candidates": [0, 3000, 6000, 9000, 12000, 15000, 18000, 21000, 24000, 27000, 30000],
-        "local_refine_window_kwp": 3000.0,
-        "local_refine_step_kwp": 500.0,
+        "capacity_kw_candidates": [0, 3000, 6000, 9000, 12000, 15000, 18000, 21000, 24000, 27000, 30000],
+        "local_refine_window_kw": 3000.0,
+        "local_refine_step_kw": 500.0,
         "rooftop_area_m2": None,
-        "module_power_density_kwp_per_m2": None,
-        "capex_sgd_per_kwp": 1200.0,
+        "module_power_density_kw_per_m2": None,
+        "capex_sgd_per_kw": 1200.0,
         "om_fraction_per_year": 0.015,
         "project_years": 25.0,
     },
@@ -59,6 +67,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "outage": {
         "seed": 42,
         "forced_event_mode": "match_saidi",
+        "night_window_start_hour": 19.0,
+        "night_window_end_hour": 23.0,
     },
     "uncertainty": {
         "parallel_workers": 1,

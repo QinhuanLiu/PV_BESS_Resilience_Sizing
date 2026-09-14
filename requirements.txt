@@ -3,3 +3,7 @@ numpy
 matplotlib
 pyyaml
 pytest
+openpyxl
+pulp
+highspy
+scipy

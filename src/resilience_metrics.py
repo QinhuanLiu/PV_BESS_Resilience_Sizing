@@ -34,8 +34,8 @@ def outage_weighted_load_kwh(
     return pd.Series(load.to_numpy() * outage.to_numpy(), index=load.index, name="outage_weighted_load_kwh")
 
 
-def eue(dispatch: pd.DataFrame, tolerance: float = DEFAULT_TOLERANCE) -> float:
-    """Return expected unserved energy from dispatch unmet-load output."""
+def ue(dispatch: pd.DataFrame, tolerance: float = DEFAULT_TOLERANCE) -> float:
+    """Return unserved energy from dispatch unmet-load output."""
     unmet = dispatch["unmet_load_kwh_equiv"].astype(float)
     return float(unmet.where(unmet > float(tolerance), 0.0).sum())
 
@@ -49,25 +49,45 @@ def outage_load_served_ratio(
     outage_load = float(outage_weighted_load.astype(float).sum())
     if outage_load <= 0.0:
         return 1.0
-    return float(1.0 - eue(dispatch, tolerance=tolerance) / outage_load)
+    return float(1.0 - ue(dispatch, tolerance=tolerance) / outage_load)
+
+
+def reliability_from_ue(
+    ue_kwh_per_year: float,
+    outage_weighted_load_total_kwh: float,
+) -> dict[str, float]:
+    """Return common outage reliability metrics from UE and outage load."""
+    scenario_ue = float(ue_kwh_per_year)
+    outage_load = float(outage_weighted_load_total_kwh)
+    if outage_load <= 0.0:
+        return {
+            "outage_weighted_load_kwh": outage_load,
+            "UE_kwh_per_year": scenario_ue,
+            "outage_load_served_ratio": 1.0,
+            "scenario_LOLP": 0.0,
+        }
+    scenario_lolp_value = scenario_ue / outage_load
+    return {
+        "outage_weighted_load_kwh": outage_load,
+        "UE_kwh_per_year": scenario_ue,
+        "outage_load_served_ratio": 1.0 - scenario_lolp_value,
+        "scenario_LOLP": scenario_lolp_value,
+    }
 
 
 def scenario_lolp(
     dispatch: pd.DataFrame,
-    outage_fraction: pd.Series,
+    outage_weighted_load: pd.Series,
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> float:
-    """Return outage-weighted loss-of-load probability for one scenario."""
-    outage = outage_fraction.astype(float)
-    total_outage_weight = float(outage.sum())
-    if total_outage_weight <= 0.0:
+    """Return unserved-energy share of outage-weighted full-building load."""
+    outage_load = float(outage_weighted_load.astype(float).sum())
+    if outage_load <= 0.0:
         return 0.0
-    unmet = dispatch["unmet_load_kwh_equiv"].astype(float)
-    loss_mask = unmet.to_numpy() > float(tolerance)
-    return float(outage[loss_mask].sum() / total_outage_weight)
+    return float(ue(dispatch, tolerance=tolerance) / outage_load)
 
 
-def achieved_lolp(scenario_lolps: Sequence[float]) -> float:
+def mean_scenario_lolp(scenario_lolps: Sequence[float]) -> float:
     """Return mean scenario LOLP across outage scenarios."""
     values = _scenario_values(scenario_lolps, "scenario_lolps")
     return float(sum(values) / len(values))
