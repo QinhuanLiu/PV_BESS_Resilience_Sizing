@@ -84,11 +84,13 @@ def save_publication_figure(
     base_path: Path | str,
     formats: Sequence[str] = RESULT_EXPORT_FORMATS,
     dpi: int = 600,
+    *,
+    allow_inside_legend: bool = False,
 ) -> dict[str, Path]:
     """Validate and export a publication figure in one or more formats."""
     base = Path(base_path)
     base.parent.mkdir(parents=True, exist_ok=True)
-    assert_publication_layout(fig)
+    assert_publication_layout(fig, allow_inside_legend=allow_inside_legend)
     paths: dict[str, Path] = {}
     for suffix in formats:
         normalized = str(suffix).lower().lstrip(".")
@@ -143,7 +145,9 @@ def _write_source_data(base: Path | str, df: pd.DataFrame) -> Path:
     return write_source_data(base, df)
 
 
-def assert_publication_layout(fig: Any, tolerance: float = 2.0) -> None:
+def assert_publication_layout(
+    fig: Any, tolerance: float = 2.0, *, allow_inside_legend: bool = False,
+) -> None:
     """Fail fast when axes, labels, legends, or colorbars are clipped or overlapping."""
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
@@ -158,7 +162,13 @@ def assert_publication_layout(fig: Any, tolerance: float = 2.0) -> None:
         _assert_text_artist_inside(fig_box, ax.yaxis.label, renderer, f"axes {index} y-label", tolerance)
         legend = ax.get_legend()
         if legend is not None:
-            _assert_legend_layout(fig_box, ax, legend, renderer, index, tolerance)
+            if allow_inside_legend:
+                legend_box = legend.get_window_extent(renderer)
+                if legend_box is None or legend_box.width <= 0 or legend_box.height <= 0:
+                    raise FigureLayoutError(f"Axes {index} legend produced an empty layout box")
+                _assert_box_inside(fig_box, legend_box, f"axes {index} legend", tolerance)
+            else:
+                _assert_legend_layout(fig_box, ax, legend, renderer, index, tolerance)
     for index, legend in enumerate(getattr(fig, "legends", []), start=1):
         legend_box = legend.get_window_extent(renderer)
         if legend_box is None or legend_box.width <= 0 or legend_box.height <= 0:

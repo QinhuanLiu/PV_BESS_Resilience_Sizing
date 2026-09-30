@@ -1,2 +1,1 @@
-"""Figure generation package for PV-BESS resilience outputs."""
-
+"""Shared plotting utilities retained for future PV-BESS outputs."""

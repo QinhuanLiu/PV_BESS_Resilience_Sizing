@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from math import isfinite
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+from .resilience_metrics import DEFAULT_TOLERANCE
 
 
 def _total_load(row: Any, cooling_cop: float, heating_cop: float) -> float:
@@ -81,7 +84,9 @@ def _reconcile_battery_origin_soc(
     total = pv + grid + initial
     if total <= 1e-12:
         return 0.0, 0.0, target
-    if np.isclose(total, target, atol=1e-9):
+    # Equivalent to numpy.isclose(total, target, rtol=1e-5, atol=1e-9),
+    # without allocating scalar NumPy intermediates on every simulated hour.
+    if total == target or (isfinite(target) and abs(total - target) <= 1e-9 + 1e-5 * abs(target)):
         return pv, grid, initial
     if total > target:
         scale = target / total
@@ -89,7 +94,28 @@ def _reconcile_battery_origin_soc(
     return pv, grid, initial + (target - total)
 
 
-def solve_dispatch_greedy(frame: pd.DataFrame, sizing: dict[str, float], config: dict[str, Any]) -> pd.DataFrame:
+def solve_dispatch_greedy(
+    frame: pd.DataFrame,
+    sizing: dict[str, float],
+    config: dict[str, Any],
+    *,
+    metrics_only: bool = False,
+    collect_totals: bool = False,
+    streaming_only: bool = False,
+) -> pd.DataFrame:
+    """Run unchanged dispatch with optional lightweight outputs and streaming totals.
+
+    With collect_totals, the returned frame's energy_totals attribute contains
+    horizon totals; no extra hourly columns or full dispatch rows are retained.
+
+    ``streaming_only`` is the no-hourly-output variant used by capacity-search
+    workflows.  It requires ``metrics_only=True`` and records reliability
+    totals in ``reliability_totals`` instead of retaining one unmet-energy row
+    per timestep.  The dispatch decisions and the energy totals are otherwise
+    exactly the same as the normal greedy path.
+    """
+    if streaming_only and not metrics_only:
+        raise ValueError("streaming_only requires metrics_only=True")
     technical = config["technical"]
     cooling_cop = float(technical.get("cooling_cop", technical.get("chiller_cop", 5.0)))
     heating_cop = float(technical.get("heating_cop", 3.5))
@@ -104,6 +130,7 @@ def solve_dispatch_greedy(frame: pd.DataFrame, sizing: dict[str, float], config:
     soc_min = batt_cap * float(batt_cfg["soc_min_fraction"])
     soc_max = batt_cap * float(batt_cfg["soc_max_fraction"])
     reserve_fraction = batt_cfg.get("normal_operation_reserve_fraction")
+    pv_export_enabled = bool(config.get("pv", {}).get("export_enabled", False))
     reserve_soc = soc_min
     if reserve_fraction is not None:
         reserve_fraction = float(reserve_fraction)
@@ -115,11 +142,19 @@ def solve_dispatch_greedy(frame: pd.DataFrame, sizing: dict[str, float], config:
     low_price = float(frame["tou_sgd_per_kwh"].quantile(0.30))
     high_price = float(frame["tou_sgd_per_kwh"].quantile(0.75))
     rows: list[dict[str, float]] = []
+    metric_rows: list[tuple[float, float]] = []
+    sum_load = sum_pv = sum_pv_load = sum_pv_charge = sum_curtail = 0.0
+    sum_grid = sum_grid_cost = sum_export = sum_export_revenue = 0.0
+    sum_charge = sum_discharge = sum_soc = sum_unmet = 0.0
+    sum_pv_discharge = sum_grid_discharge = sum_initial_discharge = 0.0
+    sum_grid_load = sum_grid_charge = 0.0
+    sum_thresholded_unmet = sum_outage_load = sum_outage_hours = 0.0
 
     for row in frame.itertuples(index=False):
         availability = float(row.grid_availability)
         outage_fraction = max(0.0, 1.0 - availability)
         price = float(row.tou_sgd_per_kwh)
+        export_price = float(getattr(row, "pv_export_sgd_per_kwh", 0.0))
         pv = float(row.pv_kwh)
         total_load = _total_load(row, cooling_cop, heating_cop)
 
@@ -134,6 +169,7 @@ def solve_dispatch_greedy(frame: pd.DataFrame, sizing: dict[str, float], config:
         pv_to_battery = 0.0
         grid_to_load = 0.0
         grid_to_battery = 0.0
+        pv_export = 0.0
         discharge_from_pv = 0.0
         discharge_from_grid = 0.0
         discharge_from_initial = 0.0
@@ -201,6 +237,10 @@ def solve_dispatch_greedy(frame: pd.DataFrame, sizing: dict[str, float], config:
             pv_used += charge
             pv -= charge
 
+        if pv_export_enabled and pv > 0:
+            pv_export = max(0.0, pv)
+            pv = 0.0
+
         if price < low_price and availability > 0 and batt_cap > 0 and batt_power > 0:
             charge_room_ac = max(0.0, (soc_max - soc) / max(eta, 1e-9))
             charge = min(batt_power * availability, charge_room_ac)
@@ -212,15 +252,47 @@ def solve_dispatch_greedy(frame: pd.DataFrame, sizing: dict[str, float], config:
 
         soc = min(soc_max, max(soc_min, soc))
         soc_pv, soc_grid, soc_initial = _reconcile_battery_origin_soc(soc, soc_pv, soc_grid, soc_initial)
+        if collect_totals:
+            sum_load += total_load
+            sum_pv += float(row.pv_kwh)
+            sum_pv_load += pv_to_load
+            sum_pv_charge += pv_to_battery
+            sum_curtail += max(0.0, pv)
+            sum_grid += grid_import
+            sum_grid_cost += grid_import * price
+            sum_export += pv_export
+            sum_export_revenue += pv_export * export_price
+            sum_charge += batt_charge
+            sum_discharge += batt_discharge
+            sum_soc += soc
+            sum_unmet += unmet
+            sum_pv_discharge += discharge_from_pv
+            sum_grid_discharge += discharge_from_grid
+            sum_initial_discharge += discharge_from_initial
+            sum_grid_load += grid_to_load
+            sum_grid_charge += grid_to_battery
+        if streaming_only:
+            # The established reliability definition discards only sub-tolerance
+            # unmet energy.  Keep this separate from raw unmet energy, which is
+            # intentionally used by the economic VoLL calculation above.
+            sum_thresholded_unmet += unmet if unmet > DEFAULT_TOLERANCE else 0.0
+            sum_outage_load += outage_fraction * total_load
+            sum_outage_hours += outage_fraction
+        if metrics_only:
+            if not streaming_only:
+                metric_rows.append((float(row.hour_index), unmet))
+            continue
         rows.append(
             {
                 "hour_index": float(row.hour_index),
                 "grid_availability": availability,
                 "outage_fraction": outage_fraction,
                 "tou_sgd_per_kwh": price,
+                "pv_export_sgd_per_kwh": export_price,
                 "total_load_e_equiv_kwh": total_load,
                 "pv_available_kwh": float(row.pv_kwh),
                 "pv_used_kwh": pv_used,
+                "pv_export_kwh": pv_export,
                 "pv_curtailed_kwh": max(0.0, pv),
                 "grid_import_kwh": grid_import,
                 "battery_charge_kwh": batt_charge,
@@ -241,10 +313,53 @@ def solve_dispatch_greedy(frame: pd.DataFrame, sizing: dict[str, float], config:
                 "unmet_load_kwh_equiv": unmet,
             }
         )
-    dispatch = pd.DataFrame(rows)
+    if metrics_only:
+        dispatch = (
+            pd.DataFrame(metric_rows, columns=["hour_index", "unmet_load_kwh_equiv"])
+            if not streaming_only else pd.DataFrame(columns=["hour_index", "unmet_load_kwh_equiv"])
+        )
+    else:
+        dispatch = pd.DataFrame(rows)
     if dispatch.isna().any().any():
         raise ValueError("Dispatch contains missing values")
     dispatch["dispatch_backend"] = "greedy"
+    if collect_totals:
+        dispatch.attrs["energy_totals"] = {
+            "dispatch_timesteps": len(frame),
+            "load_kwh_total": sum_load,
+            "pv_available_kwh_total": sum_pv,
+            "pv_to_load_kwh_total": sum_pv_load,
+            "pv_to_battery_kwh_total": sum_pv_charge,
+            "pv_curtailed_kwh_total": sum_curtail,
+            "grid_import_kwh_total": sum_grid,
+            "grid_cost_sgd_total": sum_grid_cost,
+            "pv_export_kwh_total": sum_export,
+            "pv_export_revenue_sgd_total": sum_export_revenue,
+            "battery_charge_kwh_total": sum_charge,
+            "battery_discharge_kwh_total": sum_discharge,
+            "battery_soc_kwh_sum": sum_soc,
+            "unserved_energy_kwh_total": sum_unmet,
+            "battery_discharge_from_pv_kwh_total": sum_pv_discharge,
+            "battery_discharge_from_grid_kwh_total": sum_grid_discharge,
+            "battery_discharge_from_initial_kwh_total": sum_initial_discharge,
+            "grid_to_load_kwh_total": sum_grid_load,
+            "grid_to_battery_kwh_total": sum_grid_charge,
+            "battery_soc_initial_kwh": batt_cap * float(batt_cfg["initial_soc_fraction"]),
+            "battery_soc_final_kwh": soc,
+            "battery_soc_pv_final_kwh": soc_pv,
+            "battery_soc_grid_final_kwh": soc_grid,
+            "battery_soc_initial_origin_final_kwh": soc_initial,
+        }
+    if streaming_only:
+        dispatch.attrs["reliability_totals"] = {
+            "EUE_kwh_total": sum_thresholded_unmet,
+            "outage_load_kwh_total": sum_outage_load,
+            "outage_hours_total": sum_outage_hours,
+            "LOLP": sum_thresholded_unmet / sum_outage_load if sum_outage_load > 0 else 0.0,
+            "no_outage_load": bool(sum_outage_load <= 0.0),
+        }
+    if metrics_only:
+        return dispatch
     dispatch["solver_status"] = "heuristic"
     dispatch["milp_objective_sgd"] = np.nan
     dispatch["degradation_penalty_sgd_per_kwh"] = _degradation_penalty_sgd_per_kwh(sizing, config)
@@ -274,7 +389,13 @@ def _pulp_solver(config: dict[str, Any]) -> Any:
         ) from exc
 
 
-def solve_dispatch_milp(frame: pd.DataFrame, sizing: dict[str, float], config: dict[str, Any]) -> pd.DataFrame:
+def solve_dispatch_milp(
+    frame: pd.DataFrame,
+    sizing: dict[str, float],
+    config: dict[str, Any],
+    *,
+    initial_soc_kwh: float | None = None,
+) -> pd.DataFrame:
     try:
         import pulp
     except ModuleNotFoundError as exc:
@@ -292,8 +413,14 @@ def solve_dispatch_milp(frame: pd.DataFrame, sizing: dict[str, float], config: d
     batt_power = float(sizing["battery_power_kw"])
     soc_min = batt_cap * float(batt_cfg["soc_min_fraction"])
     soc_max = batt_cap * float(batt_cfg["soc_max_fraction"])
-    initial_soc = batt_cap * float(batt_cfg["initial_soc_fraction"])
+    initial_soc = (
+        batt_cap * float(batt_cfg["initial_soc_fraction"])
+        if initial_soc_kwh is None else float(initial_soc_kwh)
+    )
+    if not isfinite(initial_soc) or not (soc_min - 1e-9 <= initial_soc <= soc_max + 1e-9):
+        raise ValueError("MILP initial SOC must be finite and within the battery SOC limits")
     reserve_fraction = batt_cfg.get("normal_operation_reserve_fraction")
+    pv_export_enabled = bool(config.get("pv", {}).get("export_enabled", False))
     reserve_soc = soc_min
     if reserve_fraction is not None:
         reserve_fraction = float(reserve_fraction)
@@ -315,6 +442,7 @@ def solve_dispatch_milp(frame: pd.DataFrame, sizing: dict[str, float], config: d
     outage_load = [outage_fraction[idx] * loads[idx] for idx in range(n)]
     pv_available = [float(row.pv_kwh) for row in records]
     prices = [float(row.tou_sgd_per_kwh) for row in records]
+    export_prices = [float(getattr(row, "pv_export_sgd_per_kwh", 0.0)) for row in records]
     voll = float(config["active_scenario"]["voll_sgd_per_kwh"])
     degradation_penalty = _degradation_penalty_sgd_per_kwh(sizing, config)
 
@@ -322,6 +450,7 @@ def solve_dispatch_milp(frame: pd.DataFrame, sizing: dict[str, float], config: d
     pv_to_normal = [pulp.LpVariable(f"pv_to_normal_{t}", lowBound=0) for t in range(n)]
     pv_to_outage = [pulp.LpVariable(f"pv_to_outage_{t}", lowBound=0) for t in range(n)]
     pv_to_battery = [pulp.LpVariable(f"pv_to_battery_{t}", lowBound=0) for t in range(n)]
+    pv_export = [pulp.LpVariable(f"pv_export_{t}", lowBound=0) for t in range(n)]
     pv_curtailed = [pulp.LpVariable(f"pv_curtailed_{t}", lowBound=0) for t in range(n)]
     grid_to_load = [pulp.LpVariable(f"grid_to_load_{t}", lowBound=0) for t in range(n)]
     grid_to_battery = [pulp.LpVariable(f"grid_to_battery_{t}", lowBound=0) for t in range(n)]
@@ -338,9 +467,11 @@ def solve_dispatch_milp(frame: pd.DataFrame, sizing: dict[str, float], config: d
     for t in range(n):
         charge = pv_to_battery[t] + grid_to_battery[t]
         discharge = discharge_normal[t] + discharge_outage[t]
-        model += pv_to_normal[t] + pv_to_outage[t] + pv_to_battery[t] + pv_curtailed[t] == pv_available[t]
+        model += pv_to_normal[t] + pv_to_outage[t] + pv_to_battery[t] + pv_export[t] + pv_curtailed[t] == pv_available[t]
         if not pv_outage_available:
             model += pv_to_outage[t] == 0.0
+        if not pv_export_enabled:
+            model += pv_export[t] == 0.0
         model += normal_load[t] == pv_to_normal[t] + discharge_normal[t] + grid_to_load[t] + unmet_normal[t]
         model += outage_load[t] == pv_to_outage[t] + discharge_outage[t] + unmet_outage[t]
         model += grid_to_load[t] <= normal_load[t]
@@ -358,6 +489,7 @@ def solve_dispatch_milp(frame: pd.DataFrame, sizing: dict[str, float], config: d
 
     model += pulp.lpSum(
         prices[t] * (grid_to_load[t] + grid_to_battery[t])
+        - export_prices[t] * pv_export[t]
         + voll * (unmet_normal[t] + unmet_outage[t])
         + degradation_penalty * (pv_to_battery[t] + grid_to_battery[t] + discharge_normal[t] + discharge_outage[t])
         for t in range(n)
@@ -375,14 +507,18 @@ def solve_dispatch_milp(frame: pd.DataFrame, sizing: dict[str, float], config: d
     soc_initial = initial_soc
     for t, row in enumerate(records):
         pv_to_load_value = float(pulp.value(pv_to_normal[t]) + pulp.value(pv_to_outage[t]))
+        pv_to_outage_value = float(pulp.value(pv_to_outage[t]))
         pv_to_battery_value = float(pulp.value(pv_to_battery[t]))
+        pv_export_value = float(pulp.value(pv_export[t]))
         grid_to_load_value = float(pulp.value(grid_to_load[t]))
         grid_to_battery_value = float(pulp.value(grid_to_battery[t]))
         charge_value = pv_to_battery_value + grid_to_battery_value
         discharge_value = float(pulp.value(discharge_normal[t]) + pulp.value(discharge_outage[t]))
+        discharge_outage_value = float(pulp.value(discharge_outage[t]))
         pv_used = pv_to_load_value + pv_to_battery_value
         grid_import = grid_to_load_value + grid_to_battery_value
         unmet = float(pulp.value(unmet_normal[t]) + pulp.value(unmet_outage[t]))
+        unmet_outage_value = float(pulp.value(unmet_outage[t]))
         (
             soc_pv,
             soc_grid,
@@ -401,20 +537,24 @@ def solve_dispatch_milp(frame: pd.DataFrame, sizing: dict[str, float], config: d
                 "grid_availability": availability[t],
                 "outage_fraction": outage_fraction[t],
                 "tou_sgd_per_kwh": prices[t],
+                "pv_export_sgd_per_kwh": export_prices[t],
                 "total_load_e_equiv_kwh": loads[t],
                 "pv_available_kwh": pv_available[t],
                 "pv_used_kwh": max(0.0, pv_used),
+                "pv_export_kwh": max(0.0, pv_export_value),
                 "pv_curtailed_kwh": max(0.0, float(pulp.value(pv_curtailed[t]))),
                 "grid_import_kwh": max(0.0, grid_import),
                 "battery_charge_kwh": max(0.0, charge_value),
                 "battery_discharge_kwh": max(0.0, discharge_value),
                 "pv_to_load_kwh": max(0.0, pv_to_load_value),
+                "pv_to_outage_kwh": max(0.0, pv_to_outage_value),
                 "pv_to_battery_kwh": max(0.0, pv_to_battery_value),
                 "grid_to_load_kwh": max(0.0, grid_to_load_value),
                 "grid_to_battery_kwh": max(0.0, grid_to_battery_value),
                 "battery_charge_from_pv_kwh": max(0.0, pv_to_battery_value),
                 "battery_charge_from_grid_kwh": max(0.0, grid_to_battery_value),
                 "battery_discharge_to_load_kwh": max(0.0, discharge_value),
+                "battery_discharge_outage_kwh": max(0.0, discharge_outage_value),
                 "battery_discharge_from_pv_kwh": max(0.0, discharge_from_pv),
                 "battery_discharge_from_grid_kwh": max(0.0, discharge_from_grid),
                 "battery_discharge_from_initial_kwh": max(0.0, discharge_from_initial),
@@ -422,6 +562,7 @@ def solve_dispatch_milp(frame: pd.DataFrame, sizing: dict[str, float], config: d
                 "battery_soc_kwh": soc_next,
                 "battery_capacity_kwh": batt_cap,
                 "unmet_load_kwh_equiv": max(0.0, unmet),
+                "unmet_outage_kwh": max(0.0, unmet_outage_value),
                 "dispatch_backend": "milp",
                 "solver_status": status,
                 "milp_objective_sgd": objective,
@@ -438,6 +579,8 @@ def solve_dispatch_milp(frame: pd.DataFrame, sizing: dict[str, float], config: d
 def solve_dispatch(frame: pd.DataFrame, sizing: dict[str, float], config: dict[str, Any]) -> pd.DataFrame:
     backend = str(config.get("dispatch", {}).get("backend", "auto")).lower()
     if backend == "auto":
+        if int(config.get("analysis", {}).get("years", 1)) > 1:
+            return solve_dispatch_greedy(frame, sizing, config)
         try:
             return solve_dispatch_milp(frame, sizing, config)
         except RuntimeError:

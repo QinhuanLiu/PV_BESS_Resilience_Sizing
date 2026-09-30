@@ -24,8 +24,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "capacity_search": {
         "coarse_intervals": 8,
         "local_refine_divisions": 6,
+        "local_search_method": "coordinate",
+        "local_search_validation_radius": 2,
         "upper_expansion_factor": 1.5,
         "max_upper_expansions": 2,
+        "warm_start_enabled": True,
+        "warm_start_max_boundary_retries": 2,
+        "warm_start_fallback": "boundary",
     },
     "technical": {
         "cooling_cop": 5.0,
@@ -35,17 +40,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pv_during_outage_available": True,
     },
     "pv": {
-        "capacity_kw_candidates": [0, 3000, 6000, 9000, 12000, 15000, 18000, 21000, 24000, 27000, 30000],
-        "local_refine_window_kw": 3000.0,
-        "local_refine_step_kw": 500.0,
+        "capacity_kw_candidates": [],
+        "local_refine_window_kw": None,
+        "local_refine_step_kw": None,
         "rooftop_area_m2": None,
+        "rooftop_area_limit_enabled": True,
+        "rooftop_area_utilization_fraction": 0.8,
+        "rooftop_capacity_limit_kw": None,
         "module_power_density_kw_per_m2": None,
         "capex_sgd_per_kw": 1200.0,
         "om_fraction_per_year": 0.015,
         "project_years": 25.0,
+        "export_enabled": False,
     },
     "battery": {
-        "energy_kwh_candidates": [0, 2500, 5000, 7500, 10000, 15000, 20000, 30000, 40000, 60000, 80000, 100000, 125000, 150000],
+        "energy_kwh_candidates": [],
         "max_c_rate": 0.5,
         "roundtrip_efficiency": 0.92,
         "soc_min_fraction": 0.10,
@@ -55,10 +64,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "rated_cycle_life_to_eol": 9000.0,
         "calendar_loss_per_year": 0.008,
         "max_replacement_years": 30.0,
-        "local_refine_window_kwh": 15000.0,
-        "local_refine_step_kwh": 500.0,
+        "local_refine_window_kwh": None,
+        "local_refine_step_kwh": None,
     },
     "economics": {
+        "discount_rate": 0.0,
         "battery_capex_sgd_per_kwh": 80.0,
         "battery_power_capex_sgd_per_kw": 30.0,
         "battery_om_fraction_per_year": 0.02,
@@ -72,6 +82,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "uncertainty": {
         "parallel_workers": 1,
+    },
+    "analysis": {
+        "years": 1,
     },
     "scenarios": {
         "singapore": {

@@ -20,14 +20,6 @@ REQUIRED_PARAMETER_COLUMNS = [
     "description",
     "中文说明",
 ]
-SENSITIVITY_PARAMETERS = [
-    "pv_capex_sgd_per_kw",
-    "battery_capex_sgd_per_kwh",
-    "battery_power_capex_sgd_per_kw",
-    "saidi_min_per_year",
-    "saifi_per_year",
-    "voll_sgd_per_kwh",
-]
 REMOVED_PV_PARAMETERS = {
     "base_pv_coverage_fraction",
     "pv_capacity_kw_at_base_coverage",
@@ -43,6 +35,7 @@ LOAD_COLUMN_ALIASES = {
     "Equipment load (kWh_e)": "Equipment",
 }
 PV_OUTPUT_COLUMN = "PV_output_kWh_per_m2"
+PV_EXPORT_PRICE_COLUMN = "pv_export_sgd_per_kwh"
 
 
 @dataclass(frozen=True)
@@ -139,40 +132,36 @@ def load_case_parameters(parameter_csv: str | Path) -> CaseParameters:
     missing_columns = [column for column in REQUIRED_PARAMETER_COLUMNS if column not in raw.columns]
     if missing_columns:
         raise ValueError(f"Parameter file {parameter_csv} is missing columns: {', '.join(missing_columns)}")
-    if len(raw) < len(SENSITIVITY_PARAMETERS):
-        raise ValueError(f"Parameter file {parameter_csv} must include the six sensitivity parameters first")
-
-    first_parameters = raw["parameter"].head(len(SENSITIVITY_PARAMETERS)).tolist()
-    if first_parameters != SENSITIVITY_PARAMETERS:
-        if first_parameters and first_parameters[0] == "fixed_pv_coverage_fraction":
-            raise ValueError(
-                "fixed_pv_coverage_fraction is no longer a sensitivity parameter; "
-                "PV capacity is optimized through adaptive capacity search, and rooftop coverage is "
-                "a derived diagnostic field."
-            )
-        raise ValueError(
-            "The first six parameters must be "
-            + ", ".join(SENSITIVITY_PARAMETERS)
-            + f"; got {', '.join(str(x) for x in first_parameters)}"
-        )
     if raw["parameter"].duplicated().any():
         repeated = raw.loc[raw["parameter"].duplicated(), "parameter"].tolist()
         raise ValueError(f"Parameter file {parameter_csv} contains duplicated parameters: {repeated}")
+    parameter_names = set(raw["parameter"].astype(str))
+    if "fixed_pv_coverage_fraction" in parameter_names:
+        raise ValueError(
+            "fixed_pv_coverage_fraction is no longer a sensitivity parameter; "
+            "PV capacity is optimized through adaptive capacity search, and rooftop coverage is "
+            "a derived diagnostic field."
+        )
     removed = sorted(set(raw["parameter"].astype(str)) & REMOVED_PV_PARAMETERS)
     if removed:
         raise ValueError(
             "Removed PV parameter(s) found in "
             f"{parameter_csv}: {', '.join(removed)}. "
             "PV-BESS sizing now derives capacity candidates adaptively from the 8760 load/PV inputs, "
-            "rooftop_area_m2, and pv_module_power_density_kw_per_m2. Rooftop coverage is retained "
-            "only as a derived diagnostic field."
+            "rooftop_area_m2, pv_rooftop_area_utilization_fraction, and "
+            "pv_module_power_density_kw_per_m2."
         )
 
     base: dict[str, Any] = {}
     sensitivity: dict[str, list[float]] = {}
+    # Imported here to keep the loader usable by the sensitivity package without
+    # introducing an import-time cycle through its planning module.
+    from ..sensitivity.catalog import is_numeric_system_parameter
+
     for row in raw.itertuples(index=False):
         parameter = str(getattr(row, "parameter"))
-        base[parameter] = _parse_value(getattr(row, "base_value"))
+        base_value = _parse_value(getattr(row, "base_value"))
+        base[parameter] = base_value
         values = _parse_sensitivity_range(
             getattr(row, "sensitivity_start"),
             getattr(row, "sensitivity_end"),
@@ -180,8 +169,19 @@ def load_case_parameters(parameter_csv: str | Path) -> CaseParameters:
             parameter,
         )
         if values:
-            if parameter not in SENSITIVITY_PARAMETERS:
-                raise ValueError(f"Only the six approved sensitivity parameters can define a range: {parameter}")
+            if not is_numeric_system_parameter(parameter):
+                raise ValueError(
+                    "Sensitivity ranges are only supported for catalogued numeric system parameters; "
+                    f"{parameter!r} is not eligible."
+                )
+            if isinstance(base_value, bool) or base_value is None:
+                raise ValueError(f"Sensitivity parameter {parameter} must have a numeric base_value")
+            try:
+                base_number = float(base_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Sensitivity parameter {parameter} must have a numeric base_value") from exc
+            if not np.isfinite(base_number):
+                raise ValueError(f"Sensitivity parameter {parameter} must have a finite base_value")
             sensitivity[parameter] = values
     return CaseParameters(base=base, sensitivity=sensitivity, raw=raw)
 
@@ -206,6 +206,13 @@ def case_config_from_parameters(global_config: dict[str, Any], case: InputCase, 
     scenario_key = case.case_key
     city_name = str(params.get("city_name") or case.city_key)
     building_name = str(params.get("building_name") or case.building_key)
+    analysis_years = _positive_int_param(
+        params,
+        "analysis_years",
+        int(global_config.get("analysis", {}).get("years", 1)),
+    )
+    config["analysis"] = deepcopy(global_config.get("analysis", {}))
+    config["analysis"]["years"] = analysis_years
 
     config["technical"] = deepcopy(global_config.get("technical", {}))
     config["technical"]["cooling_cop"] = _float_param(params, "cooling_cop", 5.0)
@@ -215,16 +222,34 @@ def case_config_from_parameters(global_config: dict[str, Any], case: InputCase, 
     config["technical"]["pv_during_outage_available"] = _bool_param(params, "pv_during_outage_available", True)
 
     config["pv"] = deepcopy(global_config.get("pv", {}))
-    config["pv"]["local_refine_window_kw"] = _nonnegative_float_param(params, "local_refine_window_kw", 3000.0)
-    config["pv"]["local_refine_step_kw"] = _positive_float_param(params, "local_refine_step_kw")
-    config["pv"]["rooftop_area_m2"] = _positive_float_param(params, "rooftop_area_m2")
-    config["pv"]["module_power_density_kw_per_m2"] = _positive_float_param(
+    pv_refine_window = _optional_nonnegative_float_param(params, "local_refine_window_kw")
+    pv_refine_step = _optional_positive_float_param(params, "local_refine_step_kw")
+    config["pv"]["local_refine_window_kw"] = pv_refine_window
+    config["pv"]["local_refine_step_kw"] = pv_refine_step
+    config["pv"]["local_refine_window_source"] = "parameter" if pv_refine_window is not None else "adaptive"
+    config["pv"]["local_refine_step_source"] = "parameter" if pv_refine_step is not None else "adaptive"
+    rooftop_area_m2 = _positive_float_param(params, "rooftop_area_m2")
+    module_power_density = _positive_float_param(
         params,
         "pv_module_power_density_kw_per_m2",
     )
+    rooftop_limit_enabled = _bool_param(params, "pv_rooftop_area_limit_enabled", True)
+    rooftop_utilization_fraction = _positive_fraction_param(
+        params,
+        "pv_rooftop_area_utilization_fraction",
+        0.8,
+    )
+    config["pv"]["rooftop_area_m2"] = rooftop_area_m2
+    config["pv"]["rooftop_area_limit_enabled"] = rooftop_limit_enabled
+    config["pv"]["rooftop_area_utilization_fraction"] = rooftop_utilization_fraction
+    config["pv"]["rooftop_capacity_limit_kw"] = float(
+        rooftop_area_m2 * rooftop_utilization_fraction * module_power_density
+    )
+    config["pv"]["module_power_density_kw_per_m2"] = module_power_density
     config["pv"]["capex_sgd_per_kw"] = _float_param(params, "pv_capex_sgd_per_kw", 1200.0)
     config["pv"]["om_fraction_per_year"] = _float_param(params, "pv_om_fraction_per_year", 0.015)
     config["pv"]["project_years"] = _float_param(params, "pv_project_years", 25.0)
+    config["pv"]["export_enabled"] = _bool_param(params, "pv_export_enabled", False)
 
     config["battery"] = deepcopy(global_config.get("battery", {}))
     battery_mappings = {
@@ -237,14 +262,23 @@ def case_config_from_parameters(global_config: dict[str, Any], case: InputCase, 
         "battery_rated_cycle_life_to_eol": ("rated_cycle_life_to_eol", 9000.0),
         "battery_calendar_loss_per_year": ("calendar_loss_per_year", 0.008),
         "battery_max_replacement_years": ("max_replacement_years", 30.0),
-        "local_refine_window_kwh": ("local_refine_window_kwh", 15000.0),
-        "local_refine_step_kwh": ("local_refine_step_kwh", 500.0),
     }
     for parameter, (config_key, default) in battery_mappings.items():
         config["battery"][config_key] = _float_param(params, parameter, default)
+    battery_refine_window = _optional_nonnegative_float_param(params, "local_refine_window_kwh")
+    battery_refine_step = _optional_positive_float_param(params, "local_refine_step_kwh")
+    config["battery"]["local_refine_window_kwh"] = battery_refine_window
+    config["battery"]["local_refine_step_kwh"] = battery_refine_step
+    config["battery"]["local_refine_window_source"] = "parameter" if battery_refine_window is not None else "adaptive"
+    config["battery"]["local_refine_step_source"] = "parameter" if battery_refine_step is not None else "adaptive"
 
     config["economics"] = deepcopy(global_config.get("economics", {}))
     battery_economics = {
+        "discount_rate": _nonnegative_float_param(
+            params,
+            "discount_rate",
+            float(config["economics"].get("discount_rate", 0.0)),
+        ),
         "battery_capex_sgd_per_kwh": _float_param(params, "battery_capex_sgd_per_kwh", 450.0),
         "battery_power_capex_sgd_per_kw": _float_param(params, "battery_power_capex_sgd_per_kw", 180.0),
         "battery_om_fraction_per_year": _float_param(params, "battery_om_fraction_per_year", 0.02),
@@ -265,18 +299,6 @@ def case_config_from_parameters(global_config: dict[str, Any], case: InputCase, 
         "night_window_end_hour",
         float(config["outage"].get("night_window_end_hour", 23.0)),
     )
-
-    config["uncertainty"] = deepcopy(global_config.get("uncertainty", {}))
-    config["uncertainty"]["baseline_scenario_count"] = _positive_int_param(
-        params,
-        "uncertainty_baseline_scenario_count",
-    )
-    config["uncertainty"]["sensitivity_scenario_count"] = _positive_int_param(
-        params,
-        "uncertainty_sensitivity_scenario_count",
-    )
-    config["uncertainty"]["seed_start"] = _nonnegative_int_param(params, "uncertainty_seed_start")
-    config["uncertainty"]["parallel_workers"] = _positive_int_param(params, "parallel_workers", default=1)
 
     config["scenarios"] = {
         scenario_key: {
@@ -337,7 +359,10 @@ def _apply_adaptive_capacity_search(case: InputCase, config: dict[str, Any]) -> 
 
     pv_annual_kw = annual_load / annual_pv_per_kw
     pv_peak_kw = peak_load / peak_pv_per_kw
-    pv_upper = max(1.10 * pv_annual_kw, 1.05 * pv_peak_kw)
+    unconstrained_pv_upper = max(1.10 * pv_annual_kw, 1.05 * pv_peak_kw)
+    rooftop_limit_enabled = bool(config["pv"].get("rooftop_area_limit_enabled", True))
+    rooftop_capacity_limit = float(config["pv"]["rooftop_capacity_limit_kw"])
+    pv_upper = min(unconstrained_pv_upper, rooftop_capacity_limit) if rooftop_limit_enabled else unconstrained_pv_upper
     battery_upper = max(0.60 * annual_load / 365.0, 1.50 * peak_load * event_hours)
 
     search_cfg = config.get("capacity_search", {})
@@ -347,11 +372,19 @@ def _apply_adaptive_capacity_search(case: InputCase, config: dict[str, Any]) -> 
     pv_candidates, pv_step = _adaptive_axis(pv_upper, intervals=intervals)
     battery_candidates, battery_step = _adaptive_axis(battery_upper, intervals=intervals)
     config["pv"]["capacity_kw_candidates"] = pv_candidates
-    config["pv"]["local_refine_window_kw"] = pv_step
-    config["pv"]["local_refine_step_kw"] = max(pv_step / refine_divisions, 1e-6)
+    if config["pv"].get("local_refine_window_kw") is None:
+        config["pv"]["local_refine_window_kw"] = pv_step
+        config["pv"]["local_refine_window_source"] = "adaptive"
+    if config["pv"].get("local_refine_step_kw") is None:
+        config["pv"]["local_refine_step_kw"] = max(_nice_step(pv_step / refine_divisions), 1e-6)
+        config["pv"]["local_refine_step_source"] = "adaptive"
     config["battery"]["energy_kwh_candidates"] = battery_candidates
-    config["battery"]["local_refine_window_kwh"] = battery_step
-    config["battery"]["local_refine_step_kwh"] = max(battery_step / refine_divisions, 1e-6)
+    if config["battery"].get("local_refine_window_kwh") is None:
+        config["battery"]["local_refine_window_kwh"] = battery_step
+        config["battery"]["local_refine_window_source"] = "adaptive"
+    if config["battery"].get("local_refine_step_kwh") is None:
+        config["battery"]["local_refine_step_kwh"] = max(_nice_step(battery_step / refine_divisions), 1e-6)
+        config["battery"]["local_refine_step_source"] = "adaptive"
     config["capacity_search"] = {
         **search_cfg,
         "strategy": "adaptive_from_8760_load_and_pv",
@@ -361,7 +394,11 @@ def _apply_adaptive_capacity_search(case: InputCase, config: dict[str, Any]) -> 
         "peak_load_e_equiv_kw": peak_load,
         "annual_pv_output_kwh_per_kw": annual_pv_per_kw,
         "peak_pv_output_kw_per_kw": peak_pv_per_kw,
+        "pv_unconstrained_upper_kw": float(unconstrained_pv_upper),
         "pv_upper_kw": float(max(pv_candidates)),
+        "pv_rooftop_area_limit_enabled": bool(rooftop_limit_enabled),
+        "pv_rooftop_area_utilization_fraction": float(config["pv"]["rooftop_area_utilization_fraction"]),
+        "pv_rooftop_capacity_limit_kw": float(rooftop_capacity_limit),
         "battery_upper_kwh": float(max(battery_candidates)),
         "pv_coarse_step_kw": float(pv_step),
         "battery_coarse_step_kwh": float(battery_step),
@@ -373,7 +410,9 @@ def _adaptive_axis(upper: float, intervals: int) -> tuple[list[float], float]:
     if upper <= 0.0:
         return [0.0, 1.0], 1.0
     step = _nice_step(float(upper) / max(int(intervals), 1))
-    return [round(i * step, 6) for i in range(int(intervals) + 1)], step
+    values = [round(i * step, 6) for i in range(int(intervals) + 1) if i * step <= float(upper) + 1e-9]
+    values = sorted(set(values) | {round(float(upper), 6)})
+    return values, step
 
 
 def _nice_step(raw_step: float) -> float:
@@ -402,11 +441,20 @@ def build_case_frame(
     _validate_required_columns(pv, [PV_OUTPUT_COLUMN], case.pv_csv)
     _validate_tou(tou, case.tou_csv)
 
+    analysis_years = max(1, int(config.get("analysis", {}).get("years", 1)))
+    total_hours = 8760 * analysis_years
+    source_hour_index = np.tile(np.arange(8760, dtype=int), analysis_years)
+    analysis_year = np.repeat(np.arange(1, analysis_years + 1, dtype=int), 8760)
     if "timestamp" in load.columns:
-        timestamp = pd.to_datetime(load["timestamp"])
+        timestamp_start = pd.to_datetime(load["timestamp"]).iloc[0]
     else:
-        timestamp = pd.date_range("2023-01-01", periods=8760, freq="h")
+        timestamp_start = pd.Timestamp("2023-01-01 00:00:00")
+    timestamp = pd.date_range(timestamp_start, periods=total_hours, freq="h")
     hour_to_price = dict(zip(tou["hour"].astype(int), tou["tou_sgd_per_kwh"].astype(float)))
+    if PV_EXPORT_PRICE_COLUMN in tou.columns:
+        hour_to_export_price = dict(zip(tou["hour"].astype(int), tou[PV_EXPORT_PRICE_COLUMN].astype(float)))
+    else:
+        hour_to_export_price = {hour: 0.0 for hour in range(24)}
 
     pv_cfg = config["pv"]
     capacity_candidates = [float(value) for value in pv_cfg.get("capacity_kw_candidates", [])]
@@ -414,8 +462,21 @@ def build_case_frame(
         raise ValueError(f"Input case {case.case_key} has no PV capacity candidates")
     active_capacity_kw = float(max(capacity_candidates) if pv_capacity_kw is None else pv_capacity_kw)
     _validate_pv_capacity_value(active_capacity_kw, case.case_key)
-    raw_pv_per_m2 = pv[PV_OUTPUT_COLUMN].astype(float)
+    raw_pv_per_m2 = pv[PV_OUTPUT_COLUMN].astype(float).to_numpy()
     rooftop_area_m2 = float(pv_cfg["rooftop_area_m2"])
+    rooftop_limit_enabled = bool(pv_cfg.get("rooftop_area_limit_enabled", True))
+    rooftop_area_utilization_fraction = float(pv_cfg.get("rooftop_area_utilization_fraction", 0.8))
+    rooftop_capacity_limit_kw = float(
+        pv_cfg.get(
+            "rooftop_capacity_limit_kw",
+            rooftop_area_m2 * rooftop_area_utilization_fraction * float(pv_cfg["module_power_density_kw_per_m2"]),
+        )
+    )
+    if rooftop_limit_enabled and active_capacity_kw > rooftop_capacity_limit_kw + 1e-6:
+        raise ValueError(
+            f"PV capacity for {case.case_key} exceeds rooftop capacity limit: "
+            f"{active_capacity_kw} kW > {rooftop_capacity_limit_kw} kW"
+        )
     module_power_density = float(pv_cfg["module_power_density_kw_per_m2"])
     pv_per_kw = raw_pv_per_m2 / module_power_density
     installed_area_m2 = active_capacity_kw / module_power_density
@@ -423,20 +484,30 @@ def build_case_frame(
 
     frame = pd.DataFrame(
         {
-            "hour_index": np.arange(8760, dtype=int),
+            "hour_index": np.arange(total_hours, dtype=int),
+            "analysis_year": analysis_year,
+            "hour_of_year": source_hour_index,
+            "source_hour_index": source_hour_index,
             "timestamp": timestamp,
-            "electric_load_kwh": load["Lighting"].astype(float) + load["Equipment"].astype(float),
-            "cooling_load_kwh_th": load["Cooling"].astype(float),
-            "heating_load_kwh_th": load["Heating"].astype(float),
-            "pv_kwh": pv_per_kw * active_capacity_kw,
+            "electric_load_kwh": np.tile(
+                (load["Lighting"].astype(float) + load["Equipment"].astype(float)).to_numpy(),
+                analysis_years,
+            ),
+            "cooling_load_kwh_th": np.tile(load["Cooling"].astype(float).to_numpy(), analysis_years),
+            "heating_load_kwh_th": np.tile(load["Heating"].astype(float).to_numpy(), analysis_years),
+            "pv_kwh": np.tile(pv_per_kw, analysis_years) * active_capacity_kw,
         }
     )
     frame["pv_capacity_kw"] = active_capacity_kw
     frame["pv_capacity_mw"] = active_capacity_kw / 1000.0
     frame["pv_installed_area_m2"] = float(installed_area_m2)
+    frame["pv_rooftop_area_limit_enabled"] = bool(rooftop_limit_enabled)
+    frame["pv_rooftop_area_utilization_fraction"] = float(rooftop_area_utilization_fraction)
+    frame["pv_rooftop_capacity_limit_kw"] = float(rooftop_capacity_limit_kw)
     frame["pv_rooftop_utilization_fraction"] = float(rooftop_utilization)
     frame["pv_rooftop_utilization_percent"] = float(rooftop_utilization * 100.0)
     frame["tou_sgd_per_kwh"] = frame["timestamp"].dt.hour.map(hour_to_price).astype(float)
+    frame[PV_EXPORT_PRICE_COLUMN] = frame["timestamp"].dt.hour.map(hour_to_export_price).astype(float)
     if frame.isna().any().any():
         raise ValueError(f"Input case {case.case_key} generated missing values")
 
@@ -446,12 +517,16 @@ def build_case_frame(
         "pv_capacity_mw": float(active_capacity_kw / 1000.0),
         "rooftop_area_m2": rooftop_area_m2,
         "pv_installed_area_m2": float(installed_area_m2),
+        "pv_rooftop_area_limit_enabled": bool(rooftop_limit_enabled),
+        "pv_rooftop_area_utilization_fraction": float(rooftop_area_utilization_fraction),
+        "pv_rooftop_capacity_limit_kw": float(rooftop_capacity_limit_kw),
         "pv_rooftop_utilization_fraction": float(rooftop_utilization),
         "pv_rooftop_utilization_percent": float(rooftop_utilization * 100.0),
         "pv_module_power_density_kw_per_m2": module_power_density,
+        "analysis_years": float(analysis_years),
         "pv_capacity_note": (
             "PV output is scaled from 1 m2 generation through module power density and PV capacity; "
-            "rooftop coverage is a derived diagnostic, not an optimization variable."
+            "PV capacity is capped by rooftop area when pv_rooftop_area_limit_enabled is true."
         ),
     }
     frame["pv_rooftop_coverage_fraction"] = frame["pv_rooftop_utilization_fraction"]
@@ -463,10 +538,89 @@ def build_case_frame(
 
 def sensitivity_runs(parameters: CaseParameters) -> list[dict[str, Any]]:
     runs: list[dict[str, Any]] = []
-    for parameter in SENSITIVITY_PARAMETERS:
-        for value in parameters.sensitivity.get(parameter, []):
+    for parameter, values in parameters.sensitivity.items():
+        for value in values:
             runs.append({"sensitivity_parameter": parameter, "sensitivity_value": value, parameter: value})
     return runs
+
+
+def validate_sensitivity_config(config: dict[str, Any]) -> None:
+    """Validate cross-parameter constraints for a prospective sensitivity point.
+
+    ``case_config_from_parameters`` deliberately remains permissive enough to
+    load historical parameter files.  Sensitivity runs, however, must reject a
+    whole plan before executing if any selected value creates an invalid model
+    configuration.
+    """
+    pv = config["pv"]
+    battery = config["battery"]
+    economics = config["economics"]
+    technical = config["technical"]
+    scenarios = config["scenarios"]
+
+    _require_nonnegative_config(pv, "capex_sgd_per_kw", "PV CAPEX")
+    _require_nonnegative_config(pv, "om_fraction_per_year", "PV O&M fraction")
+    _require_positive_config(pv, "project_years", "PV project years")
+    _require_positive_config(pv, "rooftop_area_m2", "rooftop area")
+    _require_fraction_config(pv, "rooftop_area_utilization_fraction", "PV rooftop utilization")
+    _require_positive_config(pv, "module_power_density_kw_per_m2", "PV module power density")
+
+    _require_nonnegative_config(economics, "battery_capex_sgd_per_kwh", "battery energy CAPEX")
+    _require_nonnegative_config(economics, "battery_power_capex_sgd_per_kw", "battery power CAPEX")
+    _require_nonnegative_config(economics, "battery_om_fraction_per_year", "battery O&M fraction")
+    _require_nonnegative_config(economics, "discount_rate", "discount rate")
+
+    _require_positive_config(battery, "max_c_rate", "battery max C-rate")
+    _require_fraction_config(battery, "roundtrip_efficiency", "battery round-trip efficiency")
+    _require_fraction_config(battery, "soc_min_fraction", "battery minimum SOC", allow_zero=True)
+    _require_fraction_config(battery, "soc_max_fraction", "battery maximum SOC")
+    _require_fraction_config(battery, "initial_soc_fraction", "battery initial SOC", allow_zero=True)
+    _require_fraction_config(battery, "eol_soh_fraction", "battery EOL SOH")
+    _require_positive_config(battery, "rated_cycle_life_to_eol", "battery rated cycle life")
+    _require_nonnegative_config(battery, "calendar_loss_per_year", "battery calendar loss")
+    _require_positive_config(battery, "max_replacement_years", "battery maximum replacement years")
+    soc_min = _config_number(battery, "soc_min_fraction", "battery minimum SOC")
+    soc_max = _config_number(battery, "soc_max_fraction", "battery maximum SOC")
+    soc_initial = _config_number(battery, "initial_soc_fraction", "battery initial SOC")
+    if not soc_min < soc_max:
+        raise ValueError("Battery SOC constraints require soc_min_fraction < soc_max_fraction")
+    if not soc_min <= soc_initial <= soc_max:
+        raise ValueError("Battery initial SOC must be within [soc_min_fraction, soc_max_fraction]")
+
+    _require_positive_config(technical, "cooling_cop", "cooling COP")
+    _require_positive_config(technical, "heating_cop", "heating COP")
+    for scenario_key, scenario in scenarios.items():
+        _require_nonnegative_config(scenario, "saidi_min_per_year", f"{scenario_key} SAIDI")
+        _require_nonnegative_config(scenario, "saifi_per_year", f"{scenario_key} SAIFI")
+        _require_nonnegative_config(scenario, "voll_sgd_per_kwh", f"{scenario_key} VoLL")
+
+
+def _config_number(section: dict[str, Any], key: str, label: str) -> float:
+    try:
+        value = float(section[key])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a finite numeric value") from exc
+    if not np.isfinite(value):
+        raise ValueError(f"{label} must be a finite numeric value")
+    return value
+
+
+def _require_positive_config(section: dict[str, Any], key: str, label: str) -> None:
+    if _config_number(section, key, label) <= 0.0:
+        raise ValueError(f"{label} must be > 0")
+
+
+def _require_nonnegative_config(section: dict[str, Any], key: str, label: str) -> None:
+    if _config_number(section, key, label) < 0.0:
+        raise ValueError(f"{label} must be >= 0")
+
+
+def _require_fraction_config(section: dict[str, Any], key: str, label: str, *, allow_zero: bool = False) -> None:
+    value = _config_number(section, key, label)
+    lower_ok = value >= 0.0 if allow_zero else value > 0.0
+    if not lower_ok or value > 1.0:
+        lower = ">= 0" if allow_zero else "> 0"
+        raise ValueError(f"{label} must be {lower} and <= 1")
 
 
 def write_scenario_timeseries(output_dir: Path, scenario_key: str, frame: pd.DataFrame) -> Path:
@@ -505,6 +659,8 @@ def _parse_sensitivity_range(start: Any, end: Any, step: Any, parameter: str) ->
     if any(value is None for value in values):
         raise ValueError(f"Sensitivity range for {parameter} must define start, end, and step together")
     start_f, end_f, step_f = (float(values[0]), float(values[1]), float(values[2]))
+    if not np.isfinite([start_f, end_f, step_f]).all():
+        raise ValueError(f"Sensitivity range for {parameter} must contain finite numeric values")
     if step_f <= 0:
         raise ValueError(f"Sensitivity step for {parameter} must be positive")
     if end_f < start_f:
@@ -532,28 +688,6 @@ def _positive_float_param(params: dict[str, Any], name: str) -> float:
     return result
 
 
-def _positive_int_param(params: dict[str, Any], name: str, default: int | None = None) -> int:
-    value = params.get(name)
-    if value is None:
-        if default is None:
-            raise ValueError(f"Parameter {name} is required and must be a positive integer")
-        value = default
-    result = int(float(value))
-    if result <= 0 or float(value) != float(result):
-        raise ValueError(f"Parameter {name} must be a positive integer, got {value}")
-    return result
-
-
-def _nonnegative_int_param(params: dict[str, Any], name: str) -> int:
-    value = params.get(name)
-    if value is None:
-        raise ValueError(f"Parameter {name} is required and must be a non-negative integer")
-    result = int(float(value))
-    if result < 0 or float(value) != float(result):
-        raise ValueError(f"Parameter {name} must be a non-negative integer, got {value}")
-    return result
-
-
 def _nonnegative_float_param(params: dict[str, Any], name: str, default: float) -> float:
     value = params.get(name)
     result = float(default if value is None else value)
@@ -562,36 +696,45 @@ def _nonnegative_float_param(params: dict[str, Any], name: str, default: float) 
     return result
 
 
-def _optional_float_param(params: dict[str, Any], name: str) -> float | None:
+def _positive_fraction_param(params: dict[str, Any], name: str, default: float) -> float:
+    value = params.get(name)
+    result = float(default if value is None else value)
+    if result <= 0.0 or result > 1.0:
+        raise ValueError(f"Parameter {name} must be > 0 and <= 1, got {result}")
+    return result
+
+
+def _optional_nonnegative_float_param(params: dict[str, Any], name: str) -> float | None:
     value = params.get(name)
     if value is None:
         return None
-    return float(value)
+    result = float(value)
+    if result < 0.0:
+        raise ValueError(f"Parameter {name} must be >= 0, got {result}")
+    return result
+
+
+def _optional_positive_float_param(params: dict[str, Any], name: str) -> float | None:
+    value = params.get(name)
+    if value is None:
+        return None
+    result = float(value)
+    if result <= 0.0:
+        raise ValueError(f"Parameter {name} must be > 0, got {result}")
+    return result
+
+
+def _positive_int_param(params: dict[str, Any], name: str, default: int) -> int:
+    value = params.get(name)
+    result = float(default if value is None else value)
+    if result <= 0.0 or not result.is_integer():
+        raise ValueError(f"Parameter {name} must be a positive integer, got {value if value is not None else default}")
+    return int(result)
 
 
 def _bool_param(params: dict[str, Any], name: str, default: bool) -> bool:
     value = params.get(name)
     return bool(default if value is None else value)
-
-
-def _list_param(params: dict[str, Any], name: str, default: Any) -> list[float]:
-    value = params.get(name)
-    if value is None:
-        value = default
-    if not isinstance(value, list):
-        raise ValueError(f"Parameter {name} must be a list")
-    return [float(item) for item in value]
-
-
-def _pv_capacity_candidates_param(params: dict[str, Any], name: str) -> list[float]:
-    if params.get(name) is None:
-        raise ValueError(f"Parameter {name} is required and must be a non-empty list")
-    values = _list_param(params, name, None)
-    if not values:
-        raise ValueError(f"Parameter {name} must not be empty")
-    for value in values:
-        _validate_pv_capacity_value(value, name)
-    return sorted(set(values))
 
 
 def _validate_pv_capacity_value(value: float, source: str) -> None:
@@ -617,3 +760,5 @@ def _validate_tou(tou: pd.DataFrame, path: Path) -> None:
     hours = sorted(tou["hour"].astype(int).tolist())
     if hours != list(range(24)):
         raise ValueError(f"{path} hour column must cover 0..23 exactly")
+    if PV_EXPORT_PRICE_COLUMN in tou.columns and (tou[PV_EXPORT_PRICE_COLUMN].astype(float) < 0.0).any():
+        raise ValueError(f"{path} {PV_EXPORT_PRICE_COLUMN} must be non-negative")

@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import math
 from typing import Any, Callable
 
 import pandas as pd
@@ -14,6 +15,7 @@ PvCapacityFrameBuilder = Callable[[float], tuple[pd.DataFrame, dict[str, float |
 DispatchKey = tuple[str, int, float, float]
 CandidateCacheKey = tuple[str, float, float]
 NoBessReferenceCacheKey = tuple[str, float]
+CandidatePoint = tuple[float, float]
 
 
 def scenario_config(config: dict[str, Any], scenario_key: str) -> dict[str, Any]:
@@ -147,6 +149,7 @@ def _evaluation_config_signature(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "active_scenario": _jsonable(config.get("active_scenario", {})),
         "active_scenario_key": config.get("active_scenario_key"),
+        "analysis": _jsonable(config.get("analysis", {})),
         "battery": _jsonable(config.get("battery", {})),
         "dispatch": _jsonable(config.get("dispatch", {})),
         "economics": _jsonable(config.get("economics", {})),
@@ -158,6 +161,10 @@ def _evaluation_config_signature(config: dict[str, Any]) -> dict[str, Any]:
                 "project_years": pv.get("project_years"),
                 "module_power_density_kw_per_m2": pv.get("module_power_density_kw_per_m2"),
                 "rooftop_area_m2": pv.get("rooftop_area_m2"),
+                "rooftop_area_limit_enabled": pv.get("rooftop_area_limit_enabled", True),
+                "rooftop_area_utilization_fraction": pv.get("rooftop_area_utilization_fraction"),
+                "rooftop_capacity_limit_kw": pv.get("rooftop_capacity_limit_kw"),
+                "export_enabled": pv.get("export_enabled", False),
             }
         ),
     }
@@ -263,23 +270,75 @@ def _no_bess_reference_from_result(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _refined_values(anchor: float, window: float, step: float) -> list[float]:
+def _pv_capacity_upper_limit(config: dict[str, Any]) -> float | None:
+    pv_cfg = config.get("pv", {})
+    if not bool(pv_cfg.get("rooftop_area_limit_enabled", True)):
+        return None
+    value = pv_cfg.get("rooftop_capacity_limit_kw")
+    if value is None:
+        return None
+    return max(0.0, float(value))
+
+
+def _cap_pv_axis(values: list[float], config: dict[str, Any], include_upper: bool = False) -> list[float]:
+    upper = _pv_capacity_upper_limit(config)
+    if upper is None:
+        return sorted({round(float(value), 6) for value in values})
+    capped = {round(float(value), 6) for value in values if float(value) <= upper + 1e-9}
+    if include_upper:
+        capped.add(round(float(upper), 6))
+    if len(capped) < 2 and upper > 0.0:
+        capped.add(round(float(upper), 6))
+    capped.add(0.0)
+    return sorted(capped)
+
+
+def _pv_axis_at_capacity_limit(values: list[float], config: dict[str, Any]) -> bool:
+    upper = _pv_capacity_upper_limit(config)
+    if upper is None:
+        return False
+    return max(float(value) for value in values) >= upper - 1e-6
+
+
+def _refined_values(anchor: float, window: float, step: float, upper: float | None = None) -> list[float]:
     start = max(0.0, anchor - window)
     end = max(start, anchor + window)
-    count = int(round((end - start) / step))
-    return sorted(set(round(start + i * step, 6) for i in range(count + 1)) | {anchor})
+    if upper is not None:
+        end = min(end, float(upper))
+    values: list[float] = []
+    current = start
+    while current <= end + 1e-9:
+        values.append(round(current, 6))
+        current += step
+    return sorted(set(values) | {round(float(anchor), 6)})
 
 
-def _expanded_axis(values: list[float], factor: float = 1.5) -> list[float]:
+def _expanded_axis(values: list[float], factor: float = 1.5, capacity_upper: float | None = None) -> list[float]:
     values = sorted({float(value) for value in values})
     if len(values) < 2:
         return values
-    upper = max(values)
-    if upper <= 0.0:
+    current_upper = max(values)
+    if current_upper <= 0.0:
         return values
     intervals = len(values) - 1
-    step = upper * float(factor) / intervals
-    return [round(i * step, 6) for i in range(intervals + 1)]
+    target_upper = current_upper * float(factor)
+    if capacity_upper is not None:
+        target_upper = min(target_upper, float(capacity_upper))
+    step = target_upper / intervals
+    axis = [round(i * step, 6) for i in range(intervals + 1) if i * step <= target_upper + 1e-9]
+    axis = sorted(set(axis) | {round(float(target_upper), 6)})
+    return axis
+
+
+def _nice_step(raw_step: float) -> float:
+    if raw_step <= 0.0:
+        return 1.0
+    magnitude = 10.0 ** math.floor(math.log10(raw_step))
+    for multiplier in (1.0, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0):
+        step = multiplier * magnitude
+        if step >= raw_step - 1e-12:
+            return float(step)
+    return float(10.0 * magnitude)
 
 
 def _is_upper_boundary(value: float, values: list[float]) -> bool:
@@ -316,6 +375,7 @@ def _evaluate_candidate_grid(
     search_stage: str,
     search_iteration: int,
     evaluator: CandidateEvaluator | None = None,
+    retain_dispatches: bool = True,
 ) -> tuple[pd.DataFrame, dict[DispatchKey, pd.DataFrame]]:
     rows: list[dict[str, Any]] = []
     dispatch_store: dict[DispatchKey, pd.DataFrame] = {}
@@ -329,25 +389,384 @@ def _evaluate_candidate_grid(
             result.update({"search_stage": search_stage, "search_iteration": int(search_iteration)})
             rows.append(result)
             key = _dispatch_key(search_stage, int(search_iteration), result["pv_capacity_kw"], result["battery_energy_kwh"])
+            if retain_dispatches:
+                annotated_dispatch = dispatch.copy()
+                annotated_dispatch["search_stage"] = search_stage
+                annotated_dispatch["search_iteration"] = int(search_iteration)
+                annotated_dispatch["pv_capacity_kw"] = float(result["pv_capacity_kw"])
+                annotated_dispatch["battery_energy_kwh"] = float(result["battery_energy_kwh"])
+                dispatch_store[key] = annotated_dispatch
+    summary = pd.DataFrame(rows).sort_values("pv_bess_system_annual_cost_sgd").reset_index(drop=True)
+    return summary, dispatch_store
+
+
+def _evaluate_candidate_points(
+    pv_capacity_frame_builder: PvCapacityFrameBuilder,
+    points: list[CandidatePoint],
+    config: dict[str, Any],
+    search_stage: str,
+    search_iteration: int,
+    evaluator: CandidateEvaluator | None = None,
+    retain_dispatches: bool = True,
+) -> tuple[pd.DataFrame, dict[DispatchKey, pd.DataFrame]]:
+    rows: list[dict[str, Any]] = []
+    dispatch_store: dict[DispatchKey, pd.DataFrame] = {}
+    active_evaluator = evaluator or CandidateEvaluator(config)
+    frame_cache: dict[float, tuple[pd.DataFrame, dict[str, float | str]]] = {}
+    unique_points = sorted({(round(float(pv), 6), round(float(battery), 6)) for pv, battery in points})
+    for pv_capacity, battery_energy in unique_points:
+        if pv_capacity not in frame_cache:
+            frame_cache[pv_capacity] = pv_capacity_frame_builder(float(pv_capacity))
+        frame, pv_meta = frame_cache[pv_capacity]
+        result, dispatch = active_evaluator.evaluate(
+            frame,
+            float(battery_energy),
+            pv_meta,
+            require_dispatch=retain_dispatches,
+        )
+        result.update({"search_stage": search_stage, "search_iteration": int(search_iteration)})
+        rows.append(result)
+        key = _dispatch_key(search_stage, int(search_iteration), result["pv_capacity_kw"], result["battery_energy_kwh"])
+        if retain_dispatches:
+            if dispatch is None:
+                raise ValueError("Candidate evaluator did not return dispatch for point search")
             annotated_dispatch = dispatch.copy()
             annotated_dispatch["search_stage"] = search_stage
             annotated_dispatch["search_iteration"] = int(search_iteration)
             annotated_dispatch["pv_capacity_kw"] = float(result["pv_capacity_kw"])
             annotated_dispatch["battery_energy_kwh"] = float(result["battery_energy_kwh"])
             dispatch_store[key] = annotated_dispatch
+    if not rows:
+        return pd.DataFrame(), dispatch_store
     summary = pd.DataFrame(rows).sort_values("pv_bess_system_annual_cost_sgd").reset_index(drop=True)
     return summary, dispatch_store
+
+
+def _bounded_candidate(value: float, lower: float, upper: float) -> float:
+    return round(min(max(float(value), float(lower)), float(upper)), 6)
+
+
+def _reduced_step(step: float, minimum: float) -> float:
+    if step <= minimum + 1e-9:
+        return float(minimum)
+    return max(float(minimum), _nice_step(float(step) / 2.0))
+
+
+def _initial_local_step(window: float, minimum: float) -> float:
+    if window <= 0.0:
+        return float(minimum)
+    return max(float(minimum), _nice_step(float(window) / 2.0))
+
+
+def _is_expandable_axis_edge(
+    value: float,
+    lower: float,
+    upper: float,
+    physical_lower: float | None = None,
+    physical_upper: float | None = None,
+) -> bool:
+    value_f = float(value)
+    lower_f = float(lower)
+    upper_f = float(upper)
+    if abs(value_f - lower_f) <= 1e-6 and (physical_lower is None or lower_f > float(physical_lower) + 1e-6):
+        return True
+    if abs(value_f - upper_f) <= 1e-6 and (physical_upper is None or upper_f < float(physical_upper) - 1e-6):
+        return True
+    return False
+
+
+def _coordinate_local_search(
+    pv_capacity_frame_builder: PvCapacityFrameBuilder,
+    start_best: dict[str, Any],
+    config: dict[str, Any],
+    search_iteration: int,
+    evaluator: CandidateEvaluator,
+    retain_dispatches: bool,
+) -> tuple[pd.DataFrame, dict[DispatchKey, pd.DataFrame], dict[str, Any], dict[str, float | int | bool]]:
+    pv_window = float(config["pv"]["local_refine_window_kw"])
+    battery_window = float(config["battery"]["local_refine_window_kwh"])
+    pv_min_step = float(config["pv"]["local_refine_step_kw"])
+    battery_min_step = float(config["battery"]["local_refine_step_kwh"])
+    pv_lower = max(0.0, float(start_best["pv_capacity_kw"]) - pv_window)
+    pv_upper = max(pv_lower, float(start_best["pv_capacity_kw"]) + pv_window)
+    pv_capacity_limit = _pv_capacity_upper_limit(config)
+    if pv_capacity_limit is not None:
+        pv_upper = min(pv_upper, float(pv_capacity_limit))
+    battery_lower = max(0.0, float(start_best["battery_energy_kwh"]) - battery_window)
+    battery_upper = max(battery_lower, float(start_best["battery_energy_kwh"]) + battery_window)
+    pv_step = _initial_local_step(pv_window, pv_min_step)
+    battery_step = _initial_local_step(battery_window, battery_min_step)
+    current = dict(start_best)
+    current_cost = float(current["pv_bess_system_annual_cost_sgd"])
+    rows: list[pd.DataFrame] = []
+    dispatch_store: dict[DispatchKey, pd.DataFrame] = {}
+    evaluated: set[CandidatePoint] = {
+        (round(float(current["pv_capacity_kw"]), 6), round(float(current["battery_energy_kwh"]), 6))
+    }
+    moves = 0
+    rounds = 0
+    max_rounds = int(config.get("capacity_search", {}).get("local_search_max_rounds", 200))
+
+    while rounds < max_rounds:
+        rounds += 1
+        pv = float(current["pv_capacity_kw"])
+        battery = float(current["battery_energy_kwh"])
+        neighbors = [
+            (_bounded_candidate(pv + pv_step, pv_lower, pv_upper), round(battery, 6)),
+            (_bounded_candidate(pv - pv_step, pv_lower, pv_upper), round(battery, 6)),
+            (round(pv, 6), _bounded_candidate(battery + battery_step, battery_lower, battery_upper)),
+            (round(pv, 6), _bounded_candidate(battery - battery_step, battery_lower, battery_upper)),
+        ]
+        points = [point for point in neighbors if point not in evaluated]
+        if points:
+            evaluated.update(points)
+            summary, dispatches = _evaluate_candidate_points(
+                pv_capacity_frame_builder,
+                points,
+                config,
+                search_stage="local_search",
+                search_iteration=search_iteration,
+                evaluator=evaluator,
+                retain_dispatches=retain_dispatches,
+            )
+            dispatch_store.update(dispatches)
+            if not summary.empty:
+                rows.append(summary)
+                candidate = dict(summary.iloc[0])
+                candidate_cost = float(candidate["pv_bess_system_annual_cost_sgd"])
+                if candidate_cost < current_cost - 1e-9:
+                    current = candidate
+                    current_cost = candidate_cost
+                    moves += 1
+                    continue
+
+        next_pv_step = _reduced_step(pv_step, pv_min_step)
+        next_battery_step = _reduced_step(battery_step, battery_min_step)
+        if abs(next_pv_step - pv_step) <= 1e-9 and abs(next_battery_step - battery_step) <= 1e-9:
+            break
+        pv_step = next_pv_step
+        battery_step = next_battery_step
+
+    local = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    if not local.empty:
+        local = local.sort_values("pv_bess_system_annual_cost_sgd").reset_index(drop=True)
+    edge = _is_expandable_axis_edge(
+        float(current["pv_capacity_kw"]),
+        pv_lower,
+        pv_upper,
+        physical_lower=0.0,
+        physical_upper=pv_capacity_limit,
+    ) or _is_expandable_axis_edge(
+        float(current["battery_energy_kwh"]),
+        battery_lower,
+        battery_upper,
+        physical_lower=0.0,
+        physical_upper=None,
+    )
+    metadata = {
+        "local_search_rounds": int(rounds),
+        "local_search_moves": int(moves),
+        "local_search_evaluated_points": int(max(len(evaluated) - 1, 0)),
+        "local_search_hit_edge": bool(edge),
+        "local_search_final_pv_step_kw": float(pv_step),
+        "local_search_final_battery_step_kwh": float(battery_step),
+    }
+    return local, dispatch_store, current, metadata
+
+
+def _validation_points(best: dict[str, Any], config: dict[str, Any]) -> list[CandidatePoint]:
+    radius = max(0, int(config.get("capacity_search", {}).get("local_search_validation_radius", 2)))
+    pv_step = float(config["pv"]["local_refine_step_kw"])
+    battery_step = float(config["battery"]["local_refine_step_kwh"])
+    pv = float(best["pv_capacity_kw"])
+    battery = float(best["battery_energy_kwh"])
+    pv_capacity_limit = _pv_capacity_upper_limit(config)
+    points: list[CandidatePoint] = []
+    for pv_offset in range(-radius, radius + 1):
+        for battery_offset in range(-radius, radius + 1):
+            candidate_pv = max(0.0, pv + pv_offset * pv_step)
+            if pv_capacity_limit is not None:
+                candidate_pv = min(candidate_pv, float(pv_capacity_limit))
+            points.append(
+                (
+                    round(candidate_pv, 6),
+                    round(max(0.0, battery + battery_offset * battery_step), 6),
+                )
+            )
+    return points
+
+
+def _warm_start_source_point(warm_start_best: dict[str, Any], config: dict[str, Any]) -> CandidatePoint:
+    pv_capacity = float(warm_start_best["pv_capacity_kw"])
+    pv_limit = _pv_capacity_upper_limit(config)
+    if pv_limit is not None:
+        pv_capacity = min(pv_capacity, float(pv_limit))
+    battery_energy = max(0.0, float(warm_start_best["battery_energy_kwh"]))
+    return round(max(0.0, pv_capacity), 6), round(battery_energy, 6)
+
+
+def _warm_start_fields(
+    used: bool,
+    source_pv: float | None = None,
+    source_battery: float | None = None,
+    fallback_triggered: bool = False,
+    fallback_reason: str = "",
+    candidate_count: int = 0,
+) -> dict[str, Any]:
+    return {
+        "warm_start_used": bool(used),
+        "warm_start_source_pv_capacity_kw": source_pv if source_pv is not None else pd.NA,
+        "warm_start_source_battery_energy_kwh": source_battery if source_battery is not None else pd.NA,
+        "warm_start_fallback_triggered": bool(fallback_triggered),
+        "warm_start_fallback_reason": str(fallback_reason),
+        "warm_start_candidate_count": int(candidate_count),
+    }
+
+
+def _optimize_with_warm_start(
+    pv_capacity_frame_builder: PvCapacityFrameBuilder,
+    config: dict[str, Any],
+    warm_start_best: dict[str, Any],
+    evaluator: CandidateEvaluator | None = None,
+    retain_candidate_dispatches: bool = True,
+) -> tuple[pd.DataFrame, dict[DispatchKey, pd.DataFrame], dict[str, Any]]:
+    search_cfg = config.get("capacity_search", {})
+    fallback_mode = str(search_cfg.get("warm_start_fallback", "boundary")).lower()
+    max_boundary_retries = max(0, int(search_cfg.get("warm_start_max_boundary_retries", 2)))
+    fallback_after_hits = max(1, max_boundary_retries)
+    active_evaluator = evaluator or CandidateEvaluator(config)
+    source_pv, source_battery = _warm_start_source_point(warm_start_best, config)
+    history: list[pd.DataFrame] = []
+    dispatch_store: dict[DispatchKey, pd.DataFrame] = {}
+
+    anchor, anchor_dispatches = _evaluate_candidate_points(
+        pv_capacity_frame_builder,
+        [(source_pv, source_battery)],
+        config,
+        search_stage="warm_start_anchor",
+        search_iteration=0,
+        evaluator=active_evaluator,
+        retain_dispatches=retain_candidate_dispatches,
+    )
+    dispatch_store.update(anchor_dispatches)
+    if anchor.empty:
+        return _optimize_full_search(
+            pv_capacity_frame_builder,
+            config,
+            evaluator=active_evaluator,
+            retain_candidate_dispatches=retain_candidate_dispatches,
+            warm_start_fields=_warm_start_fields(
+                True,
+                source_pv,
+                source_battery,
+                fallback_triggered=True,
+                fallback_reason="empty_anchor",
+            ),
+        )
+    history.append(anchor)
+    current_best = dict(anchor.iloc[0])
+    total_rounds = 0
+    total_moves = 0
+    total_points = int(len(anchor))
+    boundary_hits = 0
+    fallback_triggered = False
+    fallback_reason = ""
+
+    for iteration in range(max_boundary_retries + 1):
+        local_refined, refined_dispatches, current_best, metadata = _coordinate_local_search(
+            pv_capacity_frame_builder,
+            current_best,
+            config,
+            search_iteration=iteration,
+            evaluator=active_evaluator,
+            retain_dispatches=retain_candidate_dispatches,
+        )
+        dispatch_store.update(refined_dispatches)
+        total_rounds += int(metadata["local_search_rounds"])
+        total_moves += int(metadata["local_search_moves"])
+        total_points += int(metadata["local_search_evaluated_points"])
+        if not local_refined.empty:
+            history.append(local_refined)
+        if bool(metadata["local_search_hit_edge"]):
+            boundary_hits += 1
+            if fallback_mode == "boundary" and boundary_hits >= fallback_after_hits:
+                fallback_triggered = True
+                fallback_reason = "boundary"
+                break
+            continue
+        break
+
+    if fallback_triggered:
+        return _optimize_full_search(
+            pv_capacity_frame_builder,
+            config,
+            evaluator=active_evaluator,
+            retain_candidate_dispatches=retain_candidate_dispatches,
+            warm_start_fields=_warm_start_fields(
+                True,
+                source_pv,
+                source_battery,
+                fallback_triggered=True,
+                fallback_reason=fallback_reason,
+                candidate_count=total_points,
+            ),
+        )
+
+    validation, validation_dispatches = _evaluate_candidate_points(
+        pv_capacity_frame_builder,
+        _validation_points(current_best, config),
+        config,
+        search_stage="local_validation",
+        search_iteration=0,
+        evaluator=active_evaluator,
+        retain_dispatches=retain_candidate_dispatches,
+    )
+    dispatch_store.update(validation_dispatches)
+    if not validation.empty:
+        history.append(validation)
+
+    all_rows = pd.concat(history, ignore_index=True)
+    all_rows = all_rows.drop_duplicates(
+        subset=["pv_capacity_kw", "battery_energy_kwh", "search_stage", "search_iteration"],
+        keep="last",
+    )
+    all_rows = all_rows.sort_values("pv_bess_system_annual_cost_sgd").reset_index(drop=True)
+    best = dict(all_rows.iloc[0])
+    best["coarse_search_iteration"] = -1
+    best["optimal_region_iteration"] = int(all_rows["search_iteration"].max())
+    best.update(
+        {
+            "capacity_search_method": "warm_start_coordinate",
+            "local_search_rounds": int(total_rounds),
+            "local_search_moves": int(total_moves),
+            "local_search_evaluated_points": int(max(total_points - 1, 0)),
+            "local_validation_points": int(len(validation)),
+        }
+    )
+    best.update(
+        _warm_start_fields(
+            True,
+            source_pv,
+            source_battery,
+            fallback_triggered=False,
+            fallback_reason="",
+            candidate_count=int(len(all_rows)),
+        )
+    )
+    return all_rows, dispatch_store, best
 
 
 def optimize_pv_battery_with_refinement(
     pv_capacity_frame_builder: PvCapacityFrameBuilder,
     config: dict[str, Any],
     evaluator: CandidateEvaluator | None = None,
+    warm_start_best: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     all_rows, dispatch_store, best = optimize_pv_battery_with_refinement_with_dispatches(
         pv_capacity_frame_builder,
         config,
         evaluator=evaluator,
+        warm_start_best=warm_start_best,
     )
     key = _dispatch_key(
         str(best["search_stage"]),
@@ -362,8 +781,35 @@ def optimize_pv_battery_with_refinement_with_dispatches(
     pv_capacity_frame_builder: PvCapacityFrameBuilder,
     config: dict[str, Any],
     evaluator: CandidateEvaluator | None = None,
+    retain_candidate_dispatches: bool = True,
+    warm_start_best: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, dict[DispatchKey, pd.DataFrame], dict[str, Any]]:
-    pv_candidates = [float(value) for value in config["pv"]["capacity_kw_candidates"]]
+    search_cfg = config.get("capacity_search", {})
+    if warm_start_best is not None and bool(search_cfg.get("warm_start_enabled", True)):
+        return _optimize_with_warm_start(
+            pv_capacity_frame_builder,
+            config,
+            warm_start_best,
+            evaluator=evaluator,
+            retain_candidate_dispatches=retain_candidate_dispatches,
+        )
+    return _optimize_full_search(
+        pv_capacity_frame_builder,
+        config,
+        evaluator=evaluator,
+        retain_candidate_dispatches=retain_candidate_dispatches,
+        warm_start_fields=_warm_start_fields(False),
+    )
+
+
+def _optimize_full_search(
+    pv_capacity_frame_builder: PvCapacityFrameBuilder,
+    config: dict[str, Any],
+    evaluator: CandidateEvaluator | None = None,
+    retain_candidate_dispatches: bool = True,
+    warm_start_fields: dict[str, Any] | None = None,
+) -> tuple[pd.DataFrame, dict[DispatchKey, pd.DataFrame], dict[str, Any]]:
+    pv_candidates = _cap_pv_axis([float(value) for value in config["pv"]["capacity_kw_candidates"]], config)
     battery_candidates = [float(value) for value in config["battery"]["energy_kwh_candidates"]]
     search_cfg = config.get("capacity_search", {})
     expansion_factor = float(search_cfg.get("upper_expansion_factor", 1.5))
@@ -383,64 +829,133 @@ def optimize_pv_battery_with_refinement_with_dispatches(
             search_stage="coarse",
             search_iteration=iteration,
             evaluator=active_evaluator,
+            retain_dispatches=retain_candidate_dispatches,
         )
         dispatch_store.update(coarse_dispatches)
         coarse = coarse.sort_values("pv_bess_system_annual_cost_sgd").reset_index(drop=True)
         coarse_history.append(coarse)
         coarse_best = dict(coarse.iloc[0])
-        expand_pv = _is_upper_boundary(float(coarse_best["pv_capacity_kw"]), pv_candidates)
+        expand_pv = _is_upper_boundary(float(coarse_best["pv_capacity_kw"]), pv_candidates) and not _pv_axis_at_capacity_limit(
+            pv_candidates,
+            config,
+        )
         expand_battery = _is_upper_boundary(float(coarse_best["battery_energy_kwh"]), battery_candidates)
         final_coarse_iteration = iteration
         if iteration >= max_upper_expansions or not (expand_pv or expand_battery):
             break
         if expand_pv:
-            pv_candidates = _expanded_axis(pv_candidates, factor=expansion_factor)
+            pv_candidates = _expanded_axis(
+                pv_candidates,
+                factor=expansion_factor,
+                capacity_upper=_pv_capacity_upper_limit(config),
+            )
+            pv_candidates = _cap_pv_axis(pv_candidates, config)
             config["pv"]["capacity_kw_candidates"] = pv_candidates
-            config["pv"]["local_refine_window_kw"] = pv_candidates[1] - pv_candidates[0]
-            config["pv"]["local_refine_step_kw"] = max((pv_candidates[1] - pv_candidates[0]) / refine_divisions, 1e-6)
+            pv_step = pv_candidates[1] - pv_candidates[0]
+            if config["pv"].get("local_refine_window_source") != "parameter":
+                config["pv"]["local_refine_window_kw"] = pv_step
+            if config["pv"].get("local_refine_step_source") != "parameter":
+                config["pv"]["local_refine_step_kw"] = max(_nice_step(pv_step / refine_divisions), 1e-6)
         if expand_battery:
             battery_candidates = _expanded_axis(battery_candidates, factor=expansion_factor)
             config["battery"]["energy_kwh_candidates"] = battery_candidates
-            config["battery"]["local_refine_window_kwh"] = battery_candidates[1] - battery_candidates[0]
-            config["battery"]["local_refine_step_kwh"] = max((battery_candidates[1] - battery_candidates[0]) / refine_divisions, 1e-6)
+            battery_step = battery_candidates[1] - battery_candidates[0]
+            if config["battery"].get("local_refine_window_source") != "parameter":
+                config["battery"]["local_refine_window_kwh"] = battery_step
+            if config["battery"].get("local_refine_step_source") != "parameter":
+                config["battery"]["local_refine_step_kwh"] = max(_nice_step(battery_step / refine_divisions), 1e-6)
 
     coarse = coarse_history[-1]
     best_pv_capacity = float(coarse_best["pv_capacity_kw"])
     best_battery = float(coarse_best["battery_energy_kwh"])
     refined_history: list[pd.DataFrame] = []
     refined: pd.DataFrame | None = None
-    for iteration in range(2):
-        refined_pv_values = _refined_values(
-            best_pv_capacity,
-            float(config["pv"]["local_refine_window_kw"]),
-            float(config["pv"]["local_refine_step_kw"]),
-        )
-        refined_battery_values = _refined_values(
-            best_battery,
-            float(config["battery"]["local_refine_window_kwh"]),
-            float(config["battery"]["local_refine_step_kwh"]),
-        )
+    local_search_stats: dict[str, Any] = {}
+    search_method = str(search_cfg.get("local_search_method", "coordinate")).lower()
+    if search_method == "grid":
+        for iteration in range(2):
+            refined_pv_values = _refined_values(
+                best_pv_capacity,
+                float(config["pv"]["local_refine_window_kw"]),
+                float(config["pv"]["local_refine_step_kw"]),
+                upper=_pv_capacity_upper_limit(config),
+            )
+            refined_battery_values = _refined_values(
+                best_battery,
+                float(config["battery"]["local_refine_window_kwh"]),
+                float(config["battery"]["local_refine_step_kwh"]),
+            )
 
-        refined_rows: list[pd.DataFrame] = []
-        local_refined, refined_dispatches = _evaluate_candidate_grid(
+            local_refined, refined_dispatches = _evaluate_candidate_grid(
+                pv_capacity_frame_builder,
+                refined_pv_values,
+                refined_battery_values,
+                config,
+                search_stage="optimal_region",
+                search_iteration=iteration,
+                evaluator=active_evaluator,
+                retain_dispatches=retain_candidate_dispatches,
+            )
+            dispatch_store.update(refined_dispatches)
+            refined = local_refined.sort_values("pv_bess_system_annual_cost_sgd").reset_index(drop=True)
+            refined_history.append(refined)
+            refined_best = dict(refined.iloc[0])
+            best_pv_capacity = float(refined_best["pv_capacity_kw"])
+            best_battery = float(refined_best["battery_energy_kwh"])
+            if not (_is_axis_edge(best_pv_capacity, refined_pv_values) or _is_axis_edge(best_battery, refined_battery_values)):
+                break
+        local_search_stats = {
+            "capacity_search_method": "grid",
+            "local_search_rounds": 0,
+            "local_search_moves": 0,
+            "local_search_evaluated_points": int(sum(len(frame) for frame in refined_history)),
+            "local_validation_points": 0,
+        }
+    else:
+        current_best = dict(coarse_best)
+        total_rounds = 0
+        total_moves = 0
+        total_points = 0
+        for iteration in range(2):
+            local_refined, refined_dispatches, current_best, metadata = _coordinate_local_search(
+                pv_capacity_frame_builder,
+                current_best,
+                config,
+                search_iteration=iteration,
+                evaluator=active_evaluator,
+                retain_dispatches=retain_candidate_dispatches,
+            )
+            dispatch_store.update(refined_dispatches)
+            total_rounds += int(metadata["local_search_rounds"])
+            total_moves += int(metadata["local_search_moves"])
+            total_points += int(metadata["local_search_evaluated_points"])
+            if not local_refined.empty:
+                refined_history.append(local_refined)
+            best_pv_capacity = float(current_best["pv_capacity_kw"])
+            best_battery = float(current_best["battery_energy_kwh"])
+            if not bool(metadata["local_search_hit_edge"]):
+                break
+        validation, validation_dispatches = _evaluate_candidate_points(
             pv_capacity_frame_builder,
-            refined_pv_values,
-            refined_battery_values,
+            _validation_points(current_best, config),
             config,
-            search_stage="optimal_region",
-            search_iteration=iteration,
+            search_stage="local_validation",
+            search_iteration=0,
             evaluator=active_evaluator,
+            retain_dispatches=retain_candidate_dispatches,
         )
-        dispatch_store.update(refined_dispatches)
-        refined_rows.append(local_refined)
-        refined = pd.concat(refined_rows, ignore_index=True)
+        dispatch_store.update(validation_dispatches)
+        if not validation.empty:
+            refined_history.append(validation)
+        refined = pd.concat(refined_history, ignore_index=True) if refined_history else validation
         refined = refined.sort_values("pv_bess_system_annual_cost_sgd").reset_index(drop=True)
-        refined_history.append(refined)
-        refined_best = dict(refined.iloc[0])
-        best_pv_capacity = float(refined_best["pv_capacity_kw"])
-        best_battery = float(refined_best["battery_energy_kwh"])
-        if not (_is_axis_edge(best_pv_capacity, refined_pv_values) or _is_axis_edge(best_battery, refined_battery_values)):
-            break
+        local_search_stats = {
+            "capacity_search_method": "coordinate",
+            "local_search_rounds": int(total_rounds),
+            "local_search_moves": int(total_moves),
+            "local_search_evaluated_points": int(total_points),
+            "local_validation_points": int(len(validation)),
+        }
 
     if refined is None:
         raise ValueError("PV-BESS optimization failed to generate a refined candidate grid")
@@ -450,6 +965,8 @@ def optimize_pv_battery_with_refinement_with_dispatches(
     best = dict(combined.iloc[0])
     best["coarse_search_iteration"] = final_coarse_iteration
     best["optimal_region_iteration"] = int(refined["search_iteration"].max())
+    best.update(local_search_stats)
+    best.update(warm_start_fields or _warm_start_fields(False))
     all_rows = pd.concat(coarse_history + refined_history, ignore_index=True)
     all_rows = all_rows.drop_duplicates(subset=["pv_capacity_kw", "battery_energy_kwh", "search_stage", "search_iteration"], keep="last")
     all_rows = all_rows.sort_values("pv_bess_system_annual_cost_sgd").reset_index(drop=True)
@@ -468,7 +985,11 @@ def surface_search(
     evaluator = CandidateEvaluator(scenario_cfg, CandidateStore(retain_dispatch=False))
     for pv_capacity in config["pv"]["capacity_kw_candidates"]:
         frame, pv_meta = frame_builder(base_frame, scenario_key, config, float(pv_capacity))
-        frame = frame.merge(outage_profile, on="hour_index", how="left")
+        frame = frame.merge(
+            outage_profile[["hour_index", "grid_availability", "outage_fraction"]],
+            on="hour_index",
+            how="left",
+        )
         for battery in config["battery"]["energy_kwh_candidates"]:
             result, _ = evaluator.evaluate(frame, float(battery), pv_meta, require_dispatch=False)
             rows.append(
@@ -501,16 +1022,36 @@ def resilience_design(
     pv_capacity_frame_builder: PvCapacityFrameBuilder,
     config: dict[str, Any],
     scenario_key: str,
+    warm_start_best: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[DispatchKey, pd.DataFrame]]:
     sizing_cfg = scenario_config(config, scenario_key)
-    evaluator = CandidateEvaluator(sizing_cfg, CandidateStore(retain_dispatch=True))
+    retain_candidate_dispatches = bool(sizing_cfg.get("outputs", {}).get("save_candidate_dispatch_workbooks", False))
+    evaluator = CandidateEvaluator(sizing_cfg, CandidateStore(retain_dispatch=retain_candidate_dispatches))
 
     summary, dispatch_store, best = optimize_pv_battery_with_refinement_with_dispatches(
         pv_capacity_frame_builder,
         sizing_cfg,
         evaluator=evaluator,
+        retain_candidate_dispatches=retain_candidate_dispatches,
+        warm_start_best=warm_start_best,
     )
-    dispatch = _best_dispatch_from_store(best, dispatch_store)
+    if retain_candidate_dispatches:
+        dispatch = _best_dispatch_from_store(best, dispatch_store)
+    else:
+        frame, pv_meta = pv_capacity_frame_builder(float(best["pv_capacity_kw"]))
+        dispatch_result, dispatch = evaluator.evaluate(
+            frame,
+            float(best["battery_energy_kwh"]),
+            pv_meta,
+            require_dispatch=True,
+        )
+        if dispatch is None:
+            raise ValueError("Candidate evaluator did not return dispatch for the best design")
+        best.update(dispatch_result)
+        dispatch["search_stage"] = str(best["search_stage"])
+        dispatch["search_iteration"] = int(best["search_iteration"])
+        dispatch["pv_capacity_kw"] = float(best["pv_capacity_kw"])
+        dispatch["battery_energy_kwh"] = float(best["battery_energy_kwh"])
     best.update(
         {
             "scenario": scenario_key,

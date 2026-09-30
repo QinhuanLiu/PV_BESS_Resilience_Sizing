@@ -46,7 +46,11 @@ class OutageEvaluationContext:
         self.evaluator = evaluator or CandidateEvaluator(config, CandidateStore(retain_dispatch=retain_dispatch))
 
     def frame_with_outage(self, outage_profile: pd.DataFrame) -> pd.DataFrame:
-        return self.case_frame.merge(outage_profile, on="hour_index", how="left")
+        return self.case_frame.merge(
+            outage_profile[["hour_index", "grid_availability", "outage_fraction"]],
+            on="hour_index",
+            how="left",
+        )
 
 
 def generate_outage_scenarios(
@@ -132,7 +136,11 @@ def outage_profile_diagnostics(
     reference_pv_capacity_kw: float,
 ) -> dict[str, float]:
     frame, _ = build_case_frame(case, config, float(reference_pv_capacity_kw))
-    merged = frame.merge(outage_profile, on="hour_index", how="left")
+    merged = frame.merge(
+        outage_profile[["hour_index", "grid_availability", "outage_fraction"]],
+        on="hour_index",
+        how="left",
+    )
     outage_fraction = merged["outage_fraction"].astype(float)
     technical = config["technical"]
     cooling_cop = max(float(technical.get("cooling_cop", technical.get("chiller_cop", 5.0))), 1e-9)

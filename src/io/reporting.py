@@ -18,6 +18,12 @@ def parameter_sources_table(config: dict[str, Any]) -> pd.DataFrame:
     rows.extend(
         [
             {
+                "parameter": "Discount rate",
+                "value": config["economics"].get("discount_rate", 0.0),
+                "unit": "fraction/year",
+                "source_or_assumption": "Input Parameter file when provided; 0 keeps straight-line annualization.",
+            },
+            {
                 "parameter": "PV CAPEX",
                 "value": pv["capex_sgd_per_kw"],
                 "unit": "SGD/kW",

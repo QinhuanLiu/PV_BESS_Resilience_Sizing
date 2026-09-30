@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 from ..io.config import load_config
+from ..sensitivity import SENSITIVITY_MODES, run_sensitivity
 from .paths import input_dir, output_dir
 from .workflow import run_selected
 
@@ -10,36 +12,8 @@ from .workflow import run_selected
 DISPATCH_BACKEND_CHOICES = ["auto", "greedy", "milp"]
 
 
-def _resolve_analysis_selection(args: argparse.Namespace) -> tuple[str, str, list[str] | None, list[str] | None]:
-    analysis = args.analysis
-    uncertainty_analysis = args.uncertainty_analysis
-    sensitivity_parameters = args.sensitivity_parameter
-    uncertainty_sensitivity_parameters = args.uncertainty_sensitivity_parameter
-
-    if args.run_mode:
-        if args.run_mode == "all":
-            analysis = "all"
-        elif args.run_mode == "baseline":
-            analysis = "baseline"
-        elif args.run_mode == "sensitivity":
-            analysis = "sensitivity"
-        elif args.run_mode == "uncertainty":
-            analysis = "uncertainty"
-            uncertainty_analysis = "baseline"
-        elif args.run_mode == "uncertainty-sensitivity":
-            analysis = "uncertainty"
-            uncertainty_analysis = "sensitivity"
-            if uncertainty_sensitivity_parameters is None:
-                uncertainty_sensitivity_parameters = sensitivity_parameters
-
-    if args.skip_sensitivity:
-        analysis = "baseline"
-
-    return analysis, uncertainty_analysis, sensitivity_parameters, uncertainty_sensitivity_parameters
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Input-driven PV-BESS resilience-informed optimal sizing.")
+    parser = argparse.ArgumentParser(description="Core PV-BESS resilience sizing engine.")
     parser.add_argument("--config", default="config.yaml", help="Optional YAML config override.")
     parser.add_argument("--input-dir", default=None, help="Input directory; default comes from config.")
     parser.add_argument("--output-dir", default=None, help="Output directory; default comes from config.")
@@ -52,183 +26,117 @@ def main() -> None:
     parser.add_argument(
         "--save-candidate-dispatch-workbooks",
         action="store_true",
-        help="Write one XLSX workbook per evaluated candidate dispatch. Disabled by default because it is I/O intensive.",
+        help="Write one XLSX workbook per evaluated candidate dispatch. Disabled by default.",
     )
-    parser.add_argument("--skip-sensitivity", action="store_true", help="Deprecated alias for --analysis baseline.")
     parser.add_argument("--city", action="append", default=None, help="City key to run; can be repeated.")
-    parser.add_argument("--case", action="append", default=None, help="Case key to run, such as LA_UTown; can be repeated.")
+    parser.add_argument("--case", action="append", default=None, help="Case key to run; can be repeated.")
     parser.add_argument(
         "--sensitivity-parameter",
         action="append",
         default=None,
-        help=(
-            "Ordinary sensitivity parameter to run; can be repeated. Defaults to battery_capex_sgd_per_kwh, "
-            "pv_capex_sgd_per_kw, saidi_min_per_year, saifi_per_year, and voll_sgd_per_kwh for --analysis sensitivity."
-        ),
+        metavar="PARAM",
+        help="Numeric system parameter to vary; can be repeated. Use 'all' for every parameter with a configured range.",
     )
     parser.add_argument(
-        "--uncertainty-sensitivity-parameter",
-        action="append",
-        default=None,
-        help="Uncertainty sensitivity parameter to run; can be repeated. Defaults to all five for uncertainty sensitivity.",
+        "--sensitivity-mode",
+        choices=SENSITIVITY_MODES,
+        default="oat",
+        help="Sensitivity experiment design: oat (default) or factorial.",
     )
     parser.add_argument(
-        "--analysis",
-        choices=[
-            "all",
-            "baseline",
-            "sensitivity",
-            "uncertainty",
-            "frontier",
-            "representative-sensitivity",
-            "result-figures",
-            "city-comparison",
-            "single-outage-city-baseline",
-            "single-family-preliminary-result",
-            "lolp-zero-uncertainty",
-            "lolp-zero-three-year-uncertainty",
-            "variable-uncertainty",
-            "variable-uncertainty-figures",
-            "non-sg-extrapolated-cost-distribution-figures",
-        ],
-        default="all",
-        help="Top-level analysis selection. Default: all.",
-    )
-    parser.add_argument(
-        "--uncertainty-analysis",
-        choices=["all", "baseline", "sensitivity"],
-        default="all",
-        help="Sub-analysis to run when --analysis uncertainty is selected. Default: all.",
-    )
-    parser.add_argument(
-        "--run-mode",
-        choices=["all", "baseline", "sensitivity", "uncertainty", "uncertainty-sensitivity"],
-        default=None,
-        help="Deprecated alias for --analysis / --uncertainty-analysis.",
-    )
-    parser.add_argument(
-        "--figure",
-        action="append",
+        "--sensitivity-analysis-years",
         type=int,
-        choices=[4, 5, 6, 7, 8, 9, 10, 11, 12],
         default=None,
-        help="Result figure number to draw for --analysis result-figures; can be repeated.",
+        metavar="N",
+        help="Override analysis_years in each selected case's Parameter.csv.",
     )
     parser.add_argument(
-        "--city-comparison-figure",
-        action="append",
-        type=str,
-        choices=["1", "2", "3", "4", "5", "6", "7", "7b", "8", "9", "all"],
-        default=None,
-        help="City-comparison figure number to draw for --analysis city-comparison; can be repeated.",
+        "--sensitivity-workers",
+        type=int,
+        default=min(8, os.cpu_count() or 1),
+        metavar="N",
+        help="Parallel workers for independent sensitivity chains.",
     )
     parser.add_argument(
-        "--single-outage-city-figure",
-        action="append",
-        type=str,
-        choices=["1", "1b", "1c", "1d", "2", "2b", "2c", "2d", "3", "3b", "3c", "4", "5", "6a", "6b", "7", "all"],
-        default=None,
-        help="Single-outage four-city baseline figure number to draw; can be repeated.",
-    )
-    parser.add_argument(
-        "--single-family-preliminary-figure",
-        action="append",
-        type=str,
-        choices=["1", "2", "3", "4", "all"],
-        default=None,
-        help="Single Family preliminary QE-report figure number to draw; can be repeated.",
-    )
-    parser.add_argument(
-        "--city-comparison-source",
-        choices=["apartment-synthetic", "singlefamily-real"],
-        default="apartment-synthetic",
-        help="Source data mode for --analysis city-comparison.",
-    )
-    parser.add_argument(
-        "--reuse-source-data",
+        "--allow-large-sensitivity",
         action="store_true",
-        help="For --analysis result-figures, redraw figures from existing source-data CSV files.",
+        help="Allow a factorial plan with more than 500 unique experiment points.",
     )
     parser.add_argument(
-        "--uncertainty-scenario-count",
-        type=int,
-        default=None,
-        help="Override the random outage scenario count for --analysis variable-uncertainty.",
+        "--disable-sensitivity-warm-start",
+        action="store_true",
+        help="Disable warm-start between consecutive points in each factorial sensitivity chain.",
     )
     parser.add_argument(
-        "--uncertainty-seed-start",
-        type=int,
-        default=None,
-        help="Override the first random outage seed for --analysis variable-uncertainty.",
+        "--tou-analysis",
+        action="store_true",
+        help="Run mean-preserving TOU spread analysis with the default k values.",
     )
     parser.add_argument(
-        "--lolp-threshold",
+        "--tou-spread-k",
+        action="append",
         type=float,
         default=None,
-        help="Optional energy-based LOLP threshold for --analysis variable-uncertainty. Omit for no LOLP constraint.",
+        help="TOU spread k value to run; can be repeated. Providing this enables TOU analysis.",
     )
     args = parser.parse_args()
+
+    default_workers = min(8, os.cpu_count() or 1)
+    sensitivity_requested = bool(args.sensitivity_parameter)
+    sensitivity_options_used = (
+        args.sensitivity_analysis_years is not None
+        or args.sensitivity_workers != default_workers
+        or args.allow_large_sensitivity
+        or args.disable_sensitivity_warm_start
+        or args.sensitivity_mode != "oat"
+    )
+    if args.sensitivity_workers <= 0:
+        parser.error("--sensitivity-workers must be a positive integer.")
+    if args.sensitivity_analysis_years is not None and args.sensitivity_analysis_years <= 0:
+        parser.error("--sensitivity-analysis-years must be a positive integer.")
+    if sensitivity_options_used and not sensitivity_requested:
+        parser.error("Sensitivity options require at least one --sensitivity-parameter.")
+    if args.disable_sensitivity_warm_start and args.sensitivity_mode != "factorial":
+        parser.error("--disable-sensitivity-warm-start requires --sensitivity-mode factorial.")
+    if sensitivity_requested and (args.tou_analysis or args.tou_spread_k is not None):
+        parser.error("Sensitivity analysis cannot be combined with TOU analysis in one command.")
+
     config = load_config(args.config)
     if args.dispatch_backend is not None:
         config.setdefault("dispatch", {})["backend"] = args.dispatch_backend
     if args.save_candidate_dispatch_workbooks:
         config.setdefault("outputs", {})["save_candidate_dispatch_workbooks"] = True
+
     input_root = input_dir(config, args.input_dir)
     out = output_dir(config, args.output_dir)
-    analysis, uncertainty_analysis, sensitivity_parameters, uncertainty_sensitivity_parameters = _resolve_analysis_selection(args)
-    run_baseline = analysis in {"all", "baseline"}
-    run_sensitivity = analysis in {"all", "sensitivity"}
-    run_uncertainty_baseline = analysis == "all" or (
-        analysis == "uncertainty" and uncertainty_analysis in {"all", "baseline"}
-    )
-    run_uncertainty_sensitivity = analysis == "all" or (
-        analysis == "uncertainty" and uncertainty_analysis in {"all", "sensitivity"}
-    )
-    run_frontier = analysis == "frontier"
-    run_representative_sensitivity = analysis == "representative-sensitivity"
-    run_result_figures = analysis == "result-figures"
-    run_city_comparison = analysis == "city-comparison"
-    run_single_outage_city_baseline = analysis == "single-outage-city-baseline"
-    run_single_family_preliminary_result = analysis == "single-family-preliminary-result"
-    run_lolp_zero_uncertainty = analysis == "lolp-zero-uncertainty"
-    run_lolp_zero_three_year_uncertainty = analysis == "lolp-zero-three-year-uncertainty"
-    run_variable_uncertainty = analysis == "variable-uncertainty"
-    run_variable_uncertainty_figures = analysis == "variable-uncertainty-figures"
-    run_non_sg_extrapolated_cost_distribution_figures = analysis == "non-sg-extrapolated-cost-distribution-figures"
-    paths = run_selected(
-        config,
-        input_root,
-        out,
-        run_baseline=run_baseline,
-        run_sensitivity=run_sensitivity,
-        run_uncertainty_baseline=run_uncertainty_baseline,
-        run_uncertainty_sensitivity=run_uncertainty_sensitivity,
-        run_lolp_zero_uncertainty=run_lolp_zero_uncertainty,
-        run_lolp_zero_three_year_uncertainty=run_lolp_zero_three_year_uncertainty,
-        run_variable_uncertainty=run_variable_uncertainty,
-        run_variable_uncertainty_figures=run_variable_uncertainty_figures,
-        run_non_sg_extrapolated_cost_distribution_figures=run_non_sg_extrapolated_cost_distribution_figures,
-        run_frontier=run_frontier,
-        run_representative_sensitivity=run_representative_sensitivity,
-        run_result_figures=run_result_figures,
-        run_city_comparison=run_city_comparison,
-        run_single_outage_city_baseline=run_single_outage_city_baseline,
-        run_single_family_preliminary_result=run_single_family_preliminary_result,
-        city_filters=args.city,
-        case_filters=args.case,
-        sensitivity_parameters=sensitivity_parameters,
-        uncertainty_sensitivity_parameters=uncertainty_sensitivity_parameters,
-        result_figures=args.figure,
-        city_comparison_figures=args.city_comparison_figure,
-        single_outage_city_figures=args.single_outage_city_figure,
-        single_family_preliminary_figures=args.single_family_preliminary_figure,
-        city_comparison_source=args.city_comparison_source,
-        reuse_source_data=args.reuse_source_data,
-        uncertainty_scenario_count=args.uncertainty_scenario_count,
-        uncertainty_seed_start=args.uncertainty_seed_start,
-        lolp_threshold=args.lolp_threshold,
-    )
-    print("Input-driven PV-BESS resilience sizing completed.")
+    if sensitivity_requested:
+        paths = run_sensitivity(
+            config=config,
+            input_dir=input_root,
+            output_dir=out,
+            requested_parameters=args.sensitivity_parameter,
+            mode=args.sensitivity_mode,
+            analysis_years=args.sensitivity_analysis_years,
+            workers=args.sensitivity_workers,
+            allow_large=args.allow_large_sensitivity,
+            warm_start_enabled=not args.disable_sensitivity_warm_start,
+            city_filters=args.city,
+            case_filters=args.case,
+        )
+        print("Unified PV-BESS sensitivity analysis completed.")
+    else:
+        paths = run_selected(
+            config,
+            input_root,
+            out,
+            city_filters=args.city,
+            case_filters=args.case,
+            tou_analysis=args.tou_analysis,
+            tou_spread_k_values=args.tou_spread_k,
+        )
+        print("Core PV-BESS resilience sizing completed.")
+
     print(f"Input directory: {input_root}")
+    print(f"Output directory: {out}")
     for name, path in paths.items():
         print(f"{name}: {path}")
